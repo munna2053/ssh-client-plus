@@ -1,0 +1,8 @@
+/target/
+/.tools/
+/.scratch/
+*.edb
+*.log
+*.jrs
+*.chk
+*.jfm

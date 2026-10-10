@@ -1,7 +1,8 @@
 # Secure SSH Server Manager — Product and Engineering Plan
 
-**Document status:** Feasibility and staged execution proposal  
+**Document status:** Rust architecture selected; first native preview implemented; full MVP gates remain open<br>
 **Prepared:** 8 October 2026  
+**Revised:** 10 October 2026<br>
 **Target v1 client:** Windows 11 (Windows 10 only after compatibility validation)  
 **Target v1 managed hosts:** Linux servers over SSH  
 **Later clients:** macOS, then Linux  
@@ -13,14 +14,17 @@
 
 Build a **local-first, security-oriented desktop SSH manager** that combines an encrypted private-key vault, Linux host inventory, SSH terminal, safe administrative actions, and remote text editing.
 
-**Feasible?** Yes, with an important qualification: a modern, trustworthy SSH client, terminal emulator, and encrypted database are major projects in their own right. With *no bundled third-party libraries*, the sensible Windows-first design is a native C++/Win32 application using:
+**Feasible?** Yes, with an important qualification: a modern, trustworthy SSH client, terminal emulator, and encrypted database are major projects in their own right. The selected Windows-first design is a native **Rust/Win32** application, allowing Microsoft-maintained Rust API bindings while avoiding bundled third-party application frameworks, using:
 
 - **Windows platform APIs** for UI, cryptography, storage, and process execution.
 - **Microsoft-provided OpenSSH Client** (`ssh.exe`, `ssh-keygen.exe`, `sftp.exe`, optionally `ssh-agent.exe`) as an **operating-system component that must be present/enabled**.
 - A **Windows-native ESENT/ESE database** storing **application-encrypted records**, not plain SSH keys.
 - A separate master-password unlock mechanism (not merely a cosmetic login screen).
+- **Microsoft's `windows-sys`/`windows-link` crates**, with pinned versions and reviewed unsafe wrappers around Windows APIs.
 
-This requires **no third-party libraries bundled or installed specifically by the application**. It does **not** mean “literally no externally authored code”: OpenSSH is an open-source implementation delivered as a Windows feature. If the restriction also prohibits using OS-provided OpenSSH, there is no sensible short-path MVP: a new, independently audited SSH implementation would become the main project. **Do not write your own SSH protocol or cryptographic algorithms.**
+This requires **no bundled UI framework or separately installed app-specific runtime library**. Rust's standard library and Microsoft API-binding glue are compiled into the executable; those are explicit permitted dependencies. It does **not** mean “literally no externally authored code”: OpenSSH is an open-source implementation delivered as a Windows feature. If the restriction also prohibits using OS-provided OpenSSH, there is no sensible short-path MVP: a new, independently audited SSH implementation would become the main project. **Do not write your own SSH protocol or cryptographic algorithms.** See [ADR 001](docs/ADR-001-rust-native-windows.md) for the accepted policy.
+
+**Current implementation:** native host CRUD, encrypted ESE inventory, master-passphrase/DPAPI unlock, idle/workstation/suspend lock handling, a system OpenSSH console launcher, and four fixed read-only checks. The vault stores identity-file references, not private-key material yet. Existing key files/agent identities and external console sessions remain independent of vault locking. See [README](README.md) for tested behavior and [the roadmap](docs/ROADMAP.md) for unfinished requirements.
 
 ### Product positioning
 
@@ -94,12 +98,12 @@ This requires **no third-party libraries bundled or installed specifically by th
 
 | Interpretation | Can the proposed MVP satisfy it? | Consequence |
 |---|---|---|
-| **A. No bundled third-party runtime libraries/frameworks** | **Yes** | Native Win32/C++ + Windows crypto/storage + OS-provided OpenSSH. Recommended. |
+| **A. No bundled third-party application frameworks or separately installed app-specific runtime libraries** | **Yes, with the approved bindings exception** | Rust + Win32 + Microsoft API bindings + Windows crypto/storage + OS-provided OpenSSH. Selected. |
 | **B. No third-party binaries installed by this application** | **Yes, conditionally** | Require/check Windows OpenSSH optional feature, rather than downloading or bundling it. |
 | **C. No external software components at all, including OS OpenSSH** | **Not a practical secure MVP** | Requires writing/maintaining SSHv2, authentication, KEX, SFTP and terminal functionality. High security and maintenance risk. |
 | **D. No third-party code even as a development/build tool** | **Unnecessarily restrictive** | Compiler/toolchain and developer tooling become a separate compliance issue; not useful as a runtime product goal. |
 
-**Decision for this plan:** enforce **A + B**. Document OS prerequisites prominently. OS OpenSSH is a **runtime prerequisite** even though it is not an app-bundled dependency. If it is absent, provide diagnostic instructions to enable the Windows feature, and do not silently fetch binaries.
+**Decision for this plan:** enforce **A + B**, with Rust's standard library and Microsoft's `windows-sys`/`windows-link` bindings explicitly permitted. The owner selected this Windows-native Rust option. Document OS prerequisites prominently. OS OpenSSH is a **runtime prerequisite** even though it is not an app-bundled dependency. If it is absent, provide diagnostic instructions to enable the Windows feature, and do not silently fetch binaries. Build tools are development dependencies; inspect release imports to catch unintended runtime prerequisites.
 
 ---
 
@@ -109,9 +113,9 @@ This requires **no third-party libraries bundled or installed specifically by th
 
 | Layer | Windows v1 recommendation | Why / portability issue |
 |---|---|---|
-| Language | **Modern C++ (C++20)**, with disciplined memory handling | Compiles to a native desktop executable; core domain code can be reused. |
+| Language | **Rust (2024 edition)** with Microsoft Windows API bindings | Native executable and reusable core; ownership helps application memory safety, while Windows FFI still needs reviewed unsafe boundaries. |
 | UI | **Win32 + common controls**, RichEdit for text, DirectWrite/Direct2D if necessary | Available from Windows; macOS/Linux need separate UI adapters. |
-| Terminal process hosting | **ConPTY + CreateProcessW** | Native Windows pseudoconsole, but **does not provide a terminal renderer**. ANSI/VT/xterm parsing is additional engineering. |
+| Terminal process hosting | **CreateProcessW with a separate console first; ConPTY later** | The initial launcher uses a new console with its own I/O and no inherited handles. ConPTY **does not provide a terminal renderer**; ANSI/VT/xterm parsing is additional engineering. |
 | SSH operations | **OS OpenSSH**: `ssh`, `sftp`, `ssh-keygen`; optional agent | Mature cryptography/protocols; versions and agent behavior must be tested. |
 | Local database | **ESENT/ESE** native Windows database | Transactional storage with no bundled SQLite, but Windows-specific. |
 | Vault encryption | **Windows CNG AES-256-GCM**, `BCryptGenRandom`, and PBKDF2-HMAC-SHA-256 | Built-in authenticated encryption and password-derived keys. |
@@ -119,7 +123,7 @@ This requires **no third-party libraries bundled or installed specifically by th
 | File access | Windows ACLs, atomic replacement, restricted per-user app directory | Protects ESE data files, transaction logs, exports, and temporary data. |
 | Remote action framework | Hard-coded audited Linux distro/service adapters | Safe operations and consistent output; no agent on Linux. |
 
-**Why not SQLite?** It is an excellent embedded database, but bundling it violates the selected strict “no third-party libraries” rule. **Why not Qt/Electron/Tauri?** Also third-party stacks. **Why ESENT?** Windows already provides it. Its contents are *not magically encrypted*: encrypt sensitive records before storage and protect all database/log/backup files with ACLs.
+**Why not SQLite?** It is an excellent embedded database, but bundling it falls outside the selected Windows-native dependency policy. **Why not Qt/Electron/Tauri?** The owner chose native Windows controls. **Why ESENT?** Windows already provides it. Its contents are *not magically encrypted*: encrypt sensitive records before storage and protect all database/log/backup files with ACLs. Rust is the application language; it does not replace the OS SSH or crypto implementations.
 
 ### 4.2 Component boundaries
 
@@ -146,23 +150,24 @@ This requires **no third-party libraries bundled or installed specifically by th
                                    Linux OpenSSH server
 ```
 
-**Design for portability now:** expose narrow interfaces (`SecretStore`, `RecordStore`, `SshTransport`, `TerminalHost`, `NativeEditor`, `OsSessionEvents`). Linux command profiles and non-UI models remain independent from Win32 headers. The Windows implementations are replaceable when porting to macOS/Linux.
+**Design for portability now:** expose narrow interfaces (`SecretStore`, `RecordStore`, `SshTransport`, `TerminalHost`, `NativeEditor`, `OsSessionEvents`). Linux command profiles and non-UI models remain independent from Windows API types. The Windows implementations are replaceable when porting to macOS/Linux.
 
-### 4.3 Suggested source tree
+### 4.3 Initial Rust source tree
 
 ```text
-/src
-  /core           host models, session state, command policies, DTOs
-  /security       vault format, master-key lifecycle, secret handling
-  /storage        storage interface + Windows ESENT adapter
-  /ssh            OpenSSH process bridge, agent integration, SFTP
-  /linux          distro detection + command templates + parsers
-  /editor         remote file read/edit/save and conflict detection
-  /ui/windows     Win32 controls, dialogs, RichEdit, terminal display
-  /platform/win   DPAPI/CNG, OS events, ACLs, secure process execution
-/tests            unit, integration, corruption, security scenarios
-/docs             threat model, dependency policy, architecture decisions
+/src/core.rs              portable host models, validation, commands, bounded codec
+/src/windows/ui.rs        Win32 controls and lock/session workflow
+/src/windows/vault.rs     master-key lifecycle and versioned envelope
+/src/windows/crypto.rs    CNG/DPAPI wrappers and secret buffers
+/src/windows/storage.rs   ESE transactions and recovery
+/src/windows/paths.rs     per-user directories and ACLs
+/src/windows/ssh.rs       OpenSSH policy and fixed remote commands
+/src/windows/process.rs   console process ownership and Windows quoting
+/scripts/dev.ps1          local development and validation commands
+/docs                     threat model, dependency policy, architecture, roadmap
 ```
+
+Tests initially live beside the Rust modules. Add separate identity, Linux distro, remote editor, and terminal modules as their staged requirements are implemented. The first ESE schema holds one encrypted inventory envelope; per-identity, trust, and audit records follow later.
 
 ---
 
@@ -272,13 +277,13 @@ Distinguish **`daemon-reload`** (reloads systemd unit definitions) from **`reloa
 
 ### Phase 0: concrete first 10 engineering tasks
 
-- [ ] Publish the no-third-party definition (A+B above) as an Architecture Decision Record.
+- [x] Publish the dependency definition (A+B plus approved Microsoft Rust bindings) as [ADR 001](docs/ADR-001-rust-native-windows.md).
 - [ ] Confirm which Windows versions include/install OpenSSH Client and collect `ssh -V` on test machines.
 - [ ] Create two disposable Linux SSH test VMs (Ubuntu and Debian) with known host-key fingerprints.
 - [ ] Generate an Ed25519 key through OS `ssh-keygen` without exposing the passphrase on a command line.
 - [ ] Prove how the app opens an SSH session using a vault-managed identity; record on-disk/in-memory/agent exposure.
 - [ ] Run an SSH session inside ConPTY and identify the minimum VT sequences/terminal interactions needed.
-- [ ] Create a Win32/ESE DB containing encrypted test records; crash it during a transaction and recover.
+- [x] Create a Win32/ESE DB containing encrypted test records; force process termination after commit and during an uncommitted transaction, then recover.
 - [ ] Test AES-GCM tamper rejection and PBKDF2 unlock on a slow supported device.
 - [ ] Attempt a first-connection MITM/changed-host-key test; demonstrate it blocks.
 - [ ] Review findings; update product scope, threat model, schedule, and go/no-go decision.
@@ -393,7 +398,7 @@ Interview **8–12 Linux developers, sysadmins, and small-team operators** to va
 
 ## 12. Decisions to lock down now
 
-1. **Third-party meaning:** agree on *no bundled third-party code* while permitting Microsoft-provided OpenSSH as an OS feature.
+1. **Third-party meaning — decided:** Windows-native Rust, permitting Microsoft's API bindings and Rust standard library, while avoiding bundled application frameworks and app-installed OpenSSH binaries. See ADR 001.
 2. **Security contract:** decide whether only *encrypted-at-rest database storage* is required, or **no separate key file ever**, including passphrase-encrypted OpenSSH files. This materially changes complexity.
 3. **Initial customer:** individual developer/small infrastructure operator, not enterprise multi-user privileged-access management.
 4. **Initial Linux scope:** Ubuntu/Debian + systemd + apt, key-based OpenSSH, standard SFTP.
@@ -402,7 +407,7 @@ Interview **8–12 Linux developers, sysadmins, and small-team operators** to va
 
 ### Immediate next steps
 
-- [ ] Create a repository, threat model (`docs/THREAT_MODEL.md`), dependency policy (`docs/ADR-001.md`), and feature/specification issue list.
+- [x] Create a repository, [threat model](docs/THREAT_MODEL.md), [dependency policy](docs/ADR-001-rust-native-windows.md), and [feature/specification checklist](docs/ROADMAP.md).
 - [ ] Implement the five-part **Phase 0 prototype**: `ssh-keygen` → import/storage → vault unlock → agent/key bridge → verified SSH login.
 - [ ] In parallel, test ESE + AES-GCM and a ConPTY terminal prototype.
 - [ ] Select the final v0.1 scope only after those tests, then execute Phase 1.
@@ -412,6 +417,9 @@ Interview **8–12 Linux developers, sysadmins, and small-team operators** to va
 ## 13. Primary references
 
 **OS/security/standards**
+
+- Microsoft: [Rust for Windows API bindings](https://github.com/microsoft/windows-rs).
+- Rust: [Windows MSVC prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
 
 1. Microsoft: [OpenSSH for Windows overview](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-overview).
 2. Microsoft: [OpenSSH key-based authentication](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement).
