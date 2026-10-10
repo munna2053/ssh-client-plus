@@ -4,7 +4,7 @@ Updated: 10 October 2026. Scope: the Rust Windows-native inventory/SSH preview.
 
 ## Assets and boundaries
 
-The application protects stored host inventory, identity-file references, and its data-encryption key. It delegates SSH protocol security and key authentication to the Windows OpenSSH Client. Existing identity files, Windows SSH-agent identities, remote hosts, and separate console sessions have independent lifecycles.
+The application protects stored host inventory, identity-file references, saved server passwords, and its data-encryption key. It delegates SSH protocol security and authentication to the Windows OpenSSH Client. Existing identity files, Windows SSH-agent identities, remote hosts, and separate console sessions have independent lifecycles.
 
 | Scenario | Current control | Limit |
 |---|---|---|
@@ -14,12 +14,15 @@ The application protects stored host inventory, identity-file references, and it
 | Another ordinary Windows user | Protected current-user directory ACLs; reject app-directory reparse points | Administrators can take ownership; ancestor/path races need further review |
 | Unknown/changed SSH host | Dedicated OpenSSH trust file; explicit first-use fingerprint prompt; changed-key rejection | The user must verify first-use keys through a trusted source; live mismatch tests remain |
 | Malicious target/arguments | Host/user validation, fixed commands, native process launch and tested quoting | The remote host controls output; embedded rendering is not implemented |
+| Credential theft through launch arguments/files | Passwords remain separately encrypted until launch; private per-user single-use named pipe; helper image/parent and owner-PID checks; no password in argv/environment/temp files | Same-user malware can inspect process memory or interfere; OpenSSH receives plaintext to authenticate |
 | Workstation lock/suspend or app inactivity | WTS/power messages, ten-minute app idle timer, data-key clearing | External SSH sessions and agent identities remain usable |
 | Abrupt process exit during save | Durable ESE transaction; tests force process termination after commit and during an uncommitted update | Backup/restore and broader corruption/recovery testing remain |
 
 ## Cryptographic design
 
-Use only Windows CNG and DPAPI for cryptographic operations. The current vault header records a format marker/version, PBKDF2 iteration count, random salt, and DPAPI-protected encrypted data key. AES-256-GCM authenticates the wrapped key against version/KDF/salt metadata. A separate authenticated envelope contains the inventory. Passwords are not stored or sent on process command lines.
+Use only Windows CNG and DPAPI for cryptographic operations. The current vault header records a format marker/version, PBKDF2 iteration count, random salt, and DPAPI-protected encrypted data key. AES-256-GCM authenticates the wrapped key against version/KDF/salt metadata. A separate authenticated envelope contains the inventory. Each saved server password has a separate AES-GCM envelope under the same data key, a fresh 96-bit nonce, and a random credential identifier authenticated as associated data. The master passphrase is never saved. Server passwords are saved only as ciphertext and remain encrypted in the unlocked inventory.
+
+Connection launch decrypts only the selected credential. A clearing buffer passes through a private, remote-rejecting named pipe to the executable's askpass helper. The broker verifies the helper executable and SSH-parent PID; the helper verifies the pipe server's PID. Credentials are not placed in arguments, environment values, or plaintext files. A single delivery, cancellation, window closure, or two-minute timeout clears the broker's buffer. Vault lock cancels all pending brokers; it cannot retract a credential already delivered to OpenSSH. Password mode disables keyboard-interactive and limits prompts to one. Host-key confirmation never requests or receives the server password. Existing inventory version 1 decodes as key/agent records; saves use inventory version 2.
 
 Secret buffers owned by the application are cleared with volatile writes before release, and CNG handles are destroyed through ownership wrappers. This is best-effort clearing: copies in Windows edit controls, the allocator, paging, system dumps, and third-party processes cannot be guaranteed erased. No claim is made against malware running as the unlocked user, an administrator, or a compromised remote host.
 
@@ -28,7 +31,7 @@ The application-specific `known_hosts` file is plaintext and contains public hos
 ## Release gates still open
 
 - Independent review of crypto wrappers, key lifecycle, file permissions, FFI ownership, and serialized formats.
-- Real Linux-host tests: first-use fingerprint verification, changed-key hard failure, passphrase prompts, agent interoperability, disconnection, and read-only output/exit codes.
+- Real Linux-host tests: saved-password/key login, wrong-password rejection, first-use fingerprint verification, changed-key hard failure, passphrase prompts, agent interoperability, disconnection, and read-only output/exit codes.
 - Supported portable backup/restore, passphrase change, KDF calibration, and version migration.
 - Verified private-key import/generation/agent bridge, including lock-time signing revocation policy.
 - Complete MSVC/Windows SDK build and Windows version/architecture test matrix.

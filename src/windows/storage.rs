@@ -351,6 +351,8 @@ mod tests {
                 port: 22,
                 username: "deploy".into(),
                 identity_path: String::new(),
+                authentication: crate::core::Authentication::Key,
+                password: None,
             };
             store.write(&vault.seal(&[host]).unwrap()).unwrap();
             if std::env::var_os("SENTINEL_CRASH_TEST_UNCOMMITTED").is_some() {
@@ -367,6 +369,8 @@ mod tests {
                     port: 2222,
                     username: "deploy".into(),
                     identity_path: String::new(),
+                    authentication: crate::core::Authentication::Key,
+                    password: None,
                 };
                 store.write(&vault.seal(&[host]).unwrap()).unwrap();
             }

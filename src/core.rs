@@ -3,6 +3,21 @@ use crate::Result;
 const MAX_HOSTS: usize = 1_000;
 const MAX_FIELD_BYTES: usize = 4_096;
 pub const MAX_VAULT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_SSH_PASSWORD_BYTES: usize = 1022;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Authentication {
+    #[default]
+    Key,
+    Password,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedPassword {
+    pub id: [u8; 16],
+    // Remains encrypted even while the inventory is unlocked.
+    pub ciphertext: Vec<u8>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Host {
@@ -12,10 +27,20 @@ pub struct Host {
     pub username: String,
     // A reference to an existing OpenSSH key; key material is never read here.
     pub identity_path: String,
+    pub authentication: Authentication,
+    pub password: Option<SavedPassword>,
 }
 
 impl Host {
     pub fn validate(&self) -> Result<()> {
+        if self.authentication == Authentication::Password && self.password.is_none() {
+            return Err("Enter a server password before saving password login.".into());
+        }
+        if let Some(password) = &self.password
+            && !(29..=MAX_SSH_PASSWORD_BYTES + 28).contains(&password.ciphertext.len())
+        {
+            return Err("Invalid encrypted server password record.".into());
+        }
         if self.name.trim().is_empty() || self.name.chars().any(char::is_control) {
             return Err("Enter a display name without control characters.".into());
         }
@@ -86,7 +111,7 @@ pub fn encode_hosts(hosts: &[Host]) -> Result<Vec<u8>> {
     if hosts.len() > MAX_HOSTS {
         return Err("This prototype supports up to 1,000 hosts.".into());
     }
-    let mut bytes = b"SSH-HOSTS\x01".to_vec();
+    let mut bytes = b"SSH-HOSTS\x02".to_vec();
     bytes.extend_from_slice(&(hosts.len() as u32).to_le_bytes());
     for host in hosts {
         host.validate()?;
@@ -100,6 +125,18 @@ pub fn encode_hosts(hosts: &[Host]) -> Result<Vec<u8>> {
             bytes.extend_from_slice(field.as_bytes());
         }
         bytes.extend_from_slice(&host.port.to_le_bytes());
+        bytes.push(match host.authentication {
+            Authentication::Key => 0,
+            Authentication::Password => 1,
+        });
+        if let Some(password) = &host.password {
+            bytes.push(1);
+            bytes.extend_from_slice(&password.id);
+            bytes.extend_from_slice(&(password.ciphertext.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&password.ciphertext);
+        } else {
+            bytes.push(0);
+        }
     }
     if bytes.len() > MAX_VAULT_BYTES {
         return Err("Host inventory exceeds the vault size limit.".into());
@@ -153,7 +190,8 @@ pub fn decode_hosts(bytes: &[u8]) -> Result<Vec<Host>> {
         return Err("Host inventory exceeds size limit.".into());
     }
     let mut reader = Reader::new(bytes);
-    if reader.take(10)? != b"SSH-HOSTS\x01" {
+    let magic = reader.take(10)?;
+    if &magic[..9] != b"SSH-HOSTS" || !matches!(magic[9], 1 | 2) {
         return Err("Unsupported host record format.".into());
     }
     let count = reader.u32()? as usize;
@@ -162,13 +200,37 @@ pub fn decode_hosts(bytes: &[u8]) -> Result<Vec<Host>> {
     }
     let mut hosts = Vec::with_capacity(count);
     for _ in 0..count {
-        let host = Host {
+        let mut host = Host {
             name: reader.string()?,
             address: reader.string()?,
             username: reader.string()?,
             identity_path: reader.string()?,
             port: u16::from_le_bytes(reader.take(2)?.try_into().unwrap()),
+            authentication: Authentication::Key,
+            password: None,
         };
+        if magic[9] == 2 {
+            host.authentication = match reader.take(1)?[0] {
+                0 => Authentication::Key,
+                1 => Authentication::Password,
+                _ => return Err("Unsupported SSH authentication method.".into()),
+            };
+            host.password = match reader.take(1)?[0] {
+                0 => None,
+                1 => {
+                    let id = reader.take(16)?.try_into().unwrap();
+                    let size = reader.u32()? as usize;
+                    if !(29..=MAX_SSH_PASSWORD_BYTES + 28).contains(&size) {
+                        return Err("Invalid encrypted server password size.".into());
+                    }
+                    Some(SavedPassword {
+                        id,
+                        ciphertext: reader.take(size)?.to_vec(),
+                    })
+                }
+                _ => return Err("Invalid server password presence marker.".into()),
+            };
+        }
         host.validate()?;
         hosts.push(host);
     }
@@ -189,12 +251,20 @@ mod tests {
             port: 2222,
             username: "deploy".into(),
             identity_path: "C:\\Users\\Owner\\SSH Keys\\id_ed25519".into(),
+            authentication: Authentication::Key,
+            password: None,
         }
     }
 
     #[test]
     fn inventory_round_trips_unicode_and_paths() {
-        let hosts = vec![host()];
+        let mut password_host = host();
+        password_host.authentication = Authentication::Password;
+        password_host.password = Some(SavedPassword {
+            id: [4; 16],
+            ciphertext: vec![8; 48],
+        });
+        let hosts = vec![host(), password_host];
         assert_eq!(decode_hosts(&encode_hosts(&hosts).unwrap()).unwrap(), hosts);
     }
 
@@ -241,6 +311,28 @@ mod tests {
         let mut bytes = b"SSH-HOSTS\x01".to_vec();
         bytes.extend_from_slice(&1_u32.to_le_bytes());
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_hosts(&bytes).is_err());
+    }
+
+    #[test]
+    fn legacy_key_inventory_loads_and_upgrades_without_losing_hosts() {
+        let bytes = b"SSH-HOSTS\x01\x01\0\0\0\x04\0\0\0Test\x0b\0\0\0example.com\x06\0\0\0deploy\0\0\0\0\x16\0";
+        let hosts = decode_hosts(bytes).unwrap();
+        assert_eq!(hosts[0].authentication, Authentication::Key);
+        assert_eq!(hosts[0].name, "Test");
+        assert!(hosts[0].password.is_none());
+        let upgraded = encode_hosts(&hosts).unwrap();
+        assert_eq!(&upgraded[..10], b"SSH-HOSTS\x02");
+        assert_eq!(decode_hosts(&upgraded).unwrap(), hosts);
+    }
+
+    #[test]
+    fn rejects_unknown_authentication_and_missing_password() {
+        let mut bytes = encode_hosts(&[host()]).unwrap();
+        let authentication_position = bytes.len() - 2;
+        bytes[authentication_position] = 42;
+        assert!(decode_hosts(&bytes).is_err());
+        bytes[authentication_position] = 1;
         assert!(decode_hosts(&bytes).is_err());
     }
 }

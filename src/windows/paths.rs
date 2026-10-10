@@ -94,8 +94,19 @@ impl Drop for LocalAllocation {
     }
 }
 
-pub fn secure_directory(path: &Path) -> Result<()> {
-    reject_reparse_point(path)?;
+pub(crate) struct PrivateSecurity(LocalAllocation);
+
+impl PrivateSecurity {
+    pub(crate) fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.0.0,
+            bInheritHandle: 0,
+        }
+    }
+}
+
+pub(crate) fn private_security() -> Result<PrivateSecurity> {
     let mut token = null_mut();
     // SAFETY: current process pseudo-handle is valid and token is a writable out pointer.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -150,12 +161,14 @@ pub fn secure_directory(path: &Path) -> Result<()> {
     {
         return Err("Cannot create vault directory permissions.".into());
     }
-    let _descriptor_allocation = LocalAllocation(descriptor);
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor,
-        bInheritHandle: 0,
-    };
+    Ok(PrivateSecurity(LocalAllocation(descriptor)))
+}
+
+pub fn secure_directory(path: &Path) -> Result<()> {
+    reject_reparse_point(path)?;
+    let security = private_security()?;
+    let attributes = security.attributes();
+    let descriptor = attributes.lpSecurityDescriptor;
     let name = path_wide(path);
     // SAFETY: directory name and security descriptor remain alive throughout creation.
     if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {

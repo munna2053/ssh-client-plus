@@ -1,19 +1,25 @@
 use crate::Result;
-use std::{os::windows::ffi::OsStrExt, path::Path, ptr::null};
+use std::{ffi::OsString, os::windows::ffi::OsStrExt, path::Path, ptr::null};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{
-        CREATE_NEW_CONSOLE, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW,
-        WaitForSingleObject,
+        CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess,
+        PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
     },
 };
 
-pub struct ConsoleProcess(HANDLE);
+pub struct ConsoleProcess {
+    handle: HANDLE,
+    id: u32,
+}
 
 impl ConsoleProcess {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
     pub fn try_wait(&self) -> Result<Option<u32>> {
         // SAFETY: the process handle remains owned by this wrapper; zero timeout never blocks.
-        let wait = unsafe { WaitForSingleObject(self.0, 0) };
+        let wait = unsafe { WaitForSingleObject(self.handle, 0) };
         if wait == WAIT_TIMEOUT {
             return Ok(None);
         }
@@ -22,7 +28,7 @@ impl ConsoleProcess {
         }
         let mut code = 0;
         // SAFETY: the process is signaled as terminated and the exit-code out parameter is valid.
-        if unsafe { GetExitCodeProcess(self.0, &mut code) } == 0 {
+        if unsafe { GetExitCodeProcess(self.handle, &mut code) } == 0 {
             return Err("Cannot read the SSH exit code.".into());
         }
         Ok(Some(code))
@@ -33,7 +39,7 @@ impl Drop for ConsoleProcess {
     fn drop(&mut self) {
         // SAFETY: this wrapper owns the real process handle; closing it does not end the SSH session.
         unsafe {
-            CloseHandle(self.0);
+            CloseHandle(self.handle);
         }
     }
 }
@@ -77,10 +83,45 @@ fn command_line(executable: &Path, arguments: &[String]) -> Result<Vec<u16>> {
     Ok(line)
 }
 
+fn environment(overrides: &[(OsString, OsString)]) -> Result<Vec<u16>> {
+    let mut values: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| {
+            !overrides.iter().any(|(name, _)| {
+                key.to_string_lossy()
+                    .eq_ignore_ascii_case(&name.to_string_lossy())
+            })
+        })
+        .collect();
+    values.extend_from_slice(overrides);
+    values.sort_by_cached_key(|(key, _)| key.to_string_lossy().to_uppercase());
+    let mut block = Vec::new();
+    for (key, value) in values {
+        let key: Vec<_> = key.encode_wide().collect();
+        let value: Vec<_> = value.encode_wide().collect();
+        if key.is_empty()
+            || key.contains(&0)
+            || value.contains(&0)
+            || key[1..].contains(&(b'=' as u16))
+        {
+            return Err("Invalid process environment entry.".into());
+        }
+        block.extend(key);
+        block.push(b'=' as u16);
+        block.extend(value);
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+
 pub fn spawn_console(
     executable: &Path,
     arguments: &[String],
     directory: &Path,
+    overrides: &[(OsString, OsString)],
 ) -> Result<ConsoleProcess> {
     if !executable.is_absolute() {
         return Err("The SSH executable must have an absolute system path.".into());
@@ -88,6 +129,7 @@ pub fn spawn_console(
     let executable_wide = super::paths::path_wide(executable);
     let directory_wide = super::paths::path_wide(directory);
     let mut command = command_line(executable, arguments)?;
+    let environment = environment(overrides)?;
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -102,8 +144,8 @@ pub fn spawn_console(
             null(),
             null(),
             0,
-            CREATE_NEW_CONSOLE,
-            null(),
+            CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
             directory_wide.as_ptr(),
             &startup,
             &mut information,
@@ -119,13 +161,50 @@ pub fn spawn_console(
     unsafe {
         CloseHandle(information.hThread);
     }
-    Ok(ConsoleProcess(information.hProcess))
+    Ok(ConsoleProcess {
+        handle: information.hProcess,
+        id: information.dwProcessId,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
+
+    #[test]
+    fn child_environment_overrides_case_insensitively_without_changing_the_parent() {
+        let original_path = std::env::var_os("PATH");
+        let overrides = vec![
+            ("pAtH".into(), "C:\\test only".into()),
+            ("SENTINEL_ENV_TEST".into(), "Unicode ঢাকা".into()),
+        ];
+        let block = environment(&overrides).unwrap();
+        assert!(block.ends_with(&[0, 0]));
+        let entries: Vec<_> = block
+            .split(|unit| *unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf16(entry).unwrap())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key.eq_ignore_ascii_case("PATH")))
+                .count(),
+            1
+        );
+        assert!(entries.iter().any(|entry| entry == "pAtH=C:\\test only"));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry == "SENTINEL_ENV_TEST=Unicode ঢাকা")
+        );
+        assert!(std::env::var_os("PATH") == original_path);
+        assert!(environment(&[("invalid=key".into(), "value".into())]).is_err());
+        assert!(environment(&[("NAME".into(), "bad\0value".into())]).is_err());
+    }
 
     #[test]
     fn windows_argument_parser_preserves_spaces_quotes_unicode_and_trailing_slashes() {

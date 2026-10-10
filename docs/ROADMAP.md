@@ -10,7 +10,9 @@ Updated: 10 October 2026. The full scope remains in [the engineering plan](../se
 - [x] Current-user data-directory ACLs; ESE data/logs in the protected directory.
 - [x] Manual and ten-minute application idle lock; workstation-lock/suspend messages.
 - [x] Explicit system OpenSSH path, shell-free native process launch, and Windows argument quoting.
-- [x] Dedicated host trust file, first-use confirmation, key-only auth, and disabled forwarding.
+- [x] Dedicated host trust file, first-use confirmation, key/agent login, and disabled forwarding.
+- [x] Saved-password login with separate vault-key encryption, on-demand decryption, and single-use private askpass handoff.
+- [x] Legacy inventory upgrade, encrypted-password edit/reopen tests, helper delivery/cancellation and caller validation.
 - [x] System/uptime/disk/memory checks with target/command confirmation and console output.
 - [x] Wrong-password, tamper, invalid-input, native UI, encrypted-artifact, and crash-recovery tests.
 - [x] Local GNU/LLVM release build; inspect imported DLLs.
@@ -18,7 +20,7 @@ Updated: 10 October 2026. The full scope remains in [the engineering plan](../se
 ## Next: complete the feasibility gate
 
 - [ ] Build and run with the complete MSVC toolchain and Windows SDK.
-- [ ] Validate login to disposable Ubuntu/Debian hosts using encrypted key files and an agent.
+- [ ] Validate login to disposable Ubuntu/Debian hosts using encrypted key files, an agent, and saved server passwords.
 - [ ] Validate console keyboard input, passphrase prompts, resize, UTF-8, and disconnection.
 - [ ] Demonstrate first-use fingerprint verification and changed-key hard failure against real hosts.
 - [ ] Prove the encrypted-vault-to-key/agent bridge and document where every usable private key exists.

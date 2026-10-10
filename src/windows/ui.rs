@@ -1,10 +1,10 @@
 use super::{
-    crypto::Secret, paths::AppPaths, process::ConsoleProcess, storage::RecordStore,
-    vault::UnlockedVault, wide,
+    crypto::Secret, paths::AppPaths, ssh::SshSession, storage::RecordStore, vault::UnlockedVault,
+    wide,
 };
 use crate::{
     Result,
-    core::{Host, ReadOnlyAction},
+    core::{Authentication, Host, ReadOnlyAction},
 };
 use std::{
     cell::RefCell,
@@ -28,6 +28,8 @@ const ADDRESS: usize = 112;
 const PORT: usize = 113;
 const USERNAME: usize = 114;
 const IDENTITY: usize = 115;
+const AUTHENTICATION: usize = 116;
+const SERVER_PASSWORD: usize = 117;
 const NEW: usize = 120;
 const SAVE: usize = 121;
 const DELETE: usize = 122;
@@ -50,7 +52,7 @@ struct State {
     last_activity: Instant,
     retry_after: Instant,
     failures: u32,
-    children: Vec<ConsoleProcess>,
+    children: Vec<SshSession>,
 }
 
 impl State {
@@ -190,7 +192,7 @@ impl State {
             "",
             LIST,
             WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY as u32,
-            [24, 215, 310, 275],
+            [24, 215, 310, 341],
         )?;
         self.add(
             window,
@@ -198,7 +200,7 @@ impl State {
             "New server",
             NEW,
             button,
-            [24, 502, 144, 30],
+            [24, 576, 144, 30],
         )?;
         self.add(
             window,
@@ -206,14 +208,13 @@ impl State {
             "Delete",
             DELETE,
             button,
-            [184, 502, 150, 30],
+            [184, 576, 150, 30],
         )?;
         for (index, (id, label)) in [
             (NAME, "Display name"),
             (ADDRESS, "Hostname / IP"),
             (PORT, "SSH port"),
             (USERNAME, "Linux username"),
-            (IDENTITY, "Identity file path"),
         ]
         .into_iter()
         .enumerate()
@@ -232,10 +233,64 @@ impl State {
         self.add(
             window,
             "STATIC",
+            "Login method",
+            215,
+            0,
+            [360, 398, 142, 22],
+        )?;
+        self.add(
+            window,
+            "COMBOBOX",
+            "",
+            AUTHENTICATION,
+            WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+            [508, 394, 360, 150],
+        )?;
+        // SAFETY: live combo copies each string; zero selects the key login default.
+        unsafe {
+            for label in ["SSH key / agent", "Saved password"] {
+                let label = wide(label);
+                SendMessageW(
+                    self.control(AUTHENTICATION),
+                    CB_ADDSTRING,
+                    0,
+                    label.as_ptr() as isize,
+                );
+            }
+            SendMessageW(self.control(AUTHENTICATION), CB_SETCURSEL, 0, 0);
+        }
+        self.add(
+            window,
+            "STATIC",
+            "Identity file path",
+            216,
+            0,
+            [360, 442, 142, 22],
+        )?;
+        self.add(window, "EDIT", "", IDENTITY, edit, [508, 438, 360, 28])?;
+        self.add(
+            window,
+            "STATIC",
+            "Server password",
+            217,
+            0,
+            [360, 486, 142, 22],
+        )?;
+        self.add(
+            window,
+            "EDIT",
+            "",
+            SERVER_PASSWORD,
+            edit | ES_PASSWORD as u32,
+            [508, 482, 360, 28],
+        )?;
+        self.add(
+            window,
+            "STATIC",
             "Use a passphrase-protected OpenSSH key. Blank path uses your Windows SSH agent.",
             IDENTITY_NOTE,
             0,
-            [360, 442, 508, 44],
+            [360, 520, 508, 44],
         )?;
         self.add(
             window,
@@ -243,7 +298,7 @@ impl State {
             "Save server",
             SAVE,
             button,
-            [508, 502, 162, 30],
+            [508, 576, 162, 30],
         )?;
         self.add(
             window,
@@ -251,7 +306,7 @@ impl State {
             "Open SSH terminal",
             CONNECT,
             button,
-            [690, 502, 178, 30],
+            [690, 576, 178, 30],
         )?;
         self.add(
             window,
@@ -259,7 +314,7 @@ impl State {
             "Read-only checks (select a saved server)",
             220,
             0,
-            [24, 563, 800, 22],
+            [24, 626, 800, 22],
         )?;
         for (index, (id, text)) in [
             (SYSTEM, "System info"),
@@ -276,14 +331,15 @@ impl State {
                 text,
                 id,
                 button,
-                [24 + index as i32 * 213, 598, 194, 30],
+                [24 + index as i32 * 213, 660, 194, 30],
             )?;
         }
-        self.add(window, "STATIC", "", STATUS, 0, [24, 655, 844, 65])?;
+        self.add(window, "STATIC", "", STATUS, 0, [24, 710, 844, 65])?;
         // SAFETY: each edit control exists and supports EM_SETLIMITTEXT.
         unsafe {
             SendMessageW(self.control(PASSWORD), EM_SETLIMITTEXT, 1024, 0);
             SendMessageW(self.control(CONFIRM), EM_SETLIMITTEXT, 1024, 0);
+            SendMessageW(self.control(SERVER_PASSWORD), EM_SETLIMITTEXT, 1022, 0);
             for id in [NAME, ADDRESS, PORT, USERNAME, IDENTITY] {
                 SendMessageW(self.control(id), EM_SETLIMITTEXT, 2048, 0);
             }
@@ -354,8 +410,21 @@ impl State {
         // SAFETY: every referenced control has been created before this method is used.
         unsafe {
             for id in [
-                LIST, NAME, ADDRESS, PORT, USERNAME, IDENTITY, NEW, SAVE, DELETE, CONNECT, SYSTEM,
-                UPTIME, DISK, MEMORY, LOCK,
+                LIST,
+                NAME,
+                ADDRESS,
+                PORT,
+                USERNAME,
+                AUTHENTICATION,
+                NEW,
+                SAVE,
+                DELETE,
+                CONNECT,
+                SYSTEM,
+                UPTIME,
+                DISK,
+                MEMORY,
+                LOCK,
             ] {
                 EnableWindow(self.control(id), i32::from(unlocked));
             }
@@ -365,6 +434,51 @@ impl State {
                 i32::from(!unlocked && self.envelope.is_none()),
             );
             EnableWindow(self.control(UNLOCK), i32::from(!unlocked));
+        }
+        self.refresh_authentication();
+    }
+
+    fn authentication(&self) -> Authentication {
+        // SAFETY: asks the live combo for its selected entry.
+        if unsafe { SendMessageW(self.control(AUTHENTICATION), CB_GETCURSEL, 0, 0) } == 1 {
+            Authentication::Password
+        } else {
+            Authentication::Key
+        }
+    }
+
+    fn refresh_authentication(&self) {
+        let password = self.authentication() == Authentication::Password;
+        // SAFETY: both edit controls exist and are owned by this window.
+        unsafe {
+            EnableWindow(
+                self.control(IDENTITY),
+                i32::from(self.vault.is_some() && !password),
+            );
+            EnableWindow(
+                self.control(SERVER_PASSWORD),
+                i32::from(self.vault.is_some() && password),
+            );
+        }
+        if !password {
+            self.set(SERVER_PASSWORD, "");
+            let has_saved_password = self
+                .selected
+                .and_then(|index| self.hosts.get(index))
+                .is_some_and(|host| host.password.is_some());
+            self.set(IDENTITY_NOTE, if has_saved_password {
+                "Saving key login removes the saved password. Blank identity path uses your Windows SSH agent."
+            } else {
+                "Use a passphrase-protected OpenSSH key. Blank path uses your Windows SSH agent."
+            });
+        } else if self
+            .selected
+            .and_then(|index| self.hosts.get(index))
+            .is_some_and(|host| host.password.is_some())
+        {
+            self.set(IDENTITY_NOTE, "Password stored encrypted. Leave blank to keep it, or enter a replacement. Decrypted only for login.");
+        } else {
+            self.set(IDENTITY_NOTE, "Enter the server password. It is encrypted with your vault key when saved and decrypted only for login.");
         }
     }
 
@@ -387,14 +501,16 @@ impl State {
 
     fn reset_form(&mut self) {
         self.selected = None;
-        for id in [NAME, ADDRESS, USERNAME, IDENTITY] {
+        for id in [NAME, ADDRESS, USERNAME, IDENTITY, SERVER_PASSWORD] {
             self.set(id, "");
         }
         self.set(PORT, "22");
         // SAFETY: -1 clears selection in a live listbox.
         unsafe {
             SendMessageW(self.control(LIST), LB_SETCURSEL, usize::MAX, 0);
+            SendMessageW(self.control(AUTHENTICATION), CB_SETCURSEL, 0, 0);
         }
+        self.refresh_authentication();
     }
 
     fn unlock(&mut self) -> Result<()> {
@@ -438,6 +554,9 @@ impl State {
     }
 
     fn lock(&mut self) {
+        for child in &mut self.children {
+            child.cancel_pending_credentials();
+        }
         self.vault = None;
         for host in &mut self.hosts {
             for field in [
@@ -480,10 +599,35 @@ impl State {
             self.set(id, value);
         }
         self.set(PORT, &host.port.to_string());
+        self.set(SERVER_PASSWORD, "");
+        // SAFETY: host mode maps to the two entries of this live combo.
+        unsafe {
+            SendMessageW(
+                self.control(AUTHENTICATION),
+                CB_SETCURSEL,
+                usize::from(host.authentication == Authentication::Password),
+                0,
+            );
+        }
+        self.refresh_authentication();
     }
 
     fn save(&mut self) -> Result<()> {
         let vault = self.vault.as_ref().ok_or("Unlock the vault first.")?;
+        let authentication = self.authentication();
+        let mut saved_password = self
+            .selected
+            .and_then(|index| self.hosts.get(index))
+            .and_then(|host| host.password.clone());
+        if authentication == Authentication::Password {
+            let password = self.password(SERVER_PASSWORD)?;
+            if !password.0.is_empty() {
+                saved_password = Some(vault.encrypt_password(&password)?);
+            }
+        } else {
+            saved_password = None;
+            self.set(SERVER_PASSWORD, "");
+        }
         let host = Host {
             name: self.text(NAME).trim().into(),
             address: self.text(ADDRESS).trim().into(),
@@ -494,6 +638,8 @@ impl State {
                 .map_err(|_| "SSH port must be between 1 and 65535.")?,
             username: self.text(USERNAME).trim().into(),
             identity_path: self.text(IDENTITY).trim().into(),
+            authentication,
+            password: saved_password,
         };
         host.validate()?;
         let mut next = self.hosts.clone();
@@ -510,6 +656,7 @@ impl State {
         self.envelope = Some(sealed);
         self.selected = Some(selected);
         self.refresh_list();
+        self.refresh_authentication();
         self.set(STATUS, "Server saved. The database and transaction logs receive an encrypted inventory envelope.");
         Ok(())
     }
@@ -533,9 +680,7 @@ impl State {
     }
 
     fn connect(&mut self, action: Option<ReadOnlyAction>) -> Result<()> {
-        if self.vault.is_none() {
-            return Err("Unlock the vault first.".into());
-        }
+        let vault = self.vault.as_ref().ok_or("Unlock the vault first.")?;
         let host = self
             .hosts
             .get(
@@ -543,8 +688,19 @@ impl State {
                     .ok_or("Select and save a server before connecting.")?,
             )
             .ok_or("Selected server no longer exists.")?;
+        let password = if host.authentication == Authentication::Password {
+            Some(
+                vault.decrypt_password(
+                    host.password
+                        .as_ref()
+                        .ok_or("The saved password is missing.")?,
+                )?,
+            )
+        } else {
+            None
+        };
         self.children
-            .push(super::ssh::connect(&self.paths, host, action)?);
+            .push(super::ssh::connect(&self.paths, host, action, password)?);
         self.set(STATUS, "OpenSSH launched in its own console. Verify any new host fingerprint using a trusted source. A changed fingerprint blocks the connection.");
         Ok(())
     }
@@ -582,6 +738,10 @@ impl State {
         self.last_activity = Instant::now();
         if id == LIST && notification == LBN_SELCHANGE as usize && self.vault.is_some() {
             self.select();
+            return Ok(());
+        }
+        if id == AUTHENTICATION && notification == CBN_SELCHANGE as usize {
+            self.refresh_authentication();
             return Ok(());
         }
         if notification != BN_CLICKED as usize {
@@ -624,7 +784,7 @@ impl State {
             }
         });
         if let Some(code) = failed_exit {
-            self.set(STATUS, &format!("OpenSSH exited with code {code}. Check the host address, trust decision, and identity; retry from the server list."));
+            self.set(STATUS, &format!("OpenSSH exited with code {code}. Check the host address, trust decision, and login credentials; retry from the server list."));
         }
     }
 }
@@ -773,7 +933,7 @@ fn create_window(paths: AppPaths) -> Result<HWND> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             916,
-            790,
+            840,
             null_mut(),
             null_mut(),
             instance,
@@ -864,15 +1024,46 @@ mod tests {
                 state.set(USERNAME, "deploy");
                 state.save().unwrap();
                 assert_eq!(state.hosts.len(), 1);
+                assert_eq!(state.hosts[0].authentication, Authentication::Key);
+                SendMessageW(state.control(AUTHENTICATION), CB_SETCURSEL, 1, 0);
+                state
+                    .command(AUTHENTICATION, CBN_SELCHANGE as usize)
+                    .unwrap();
+                assert_eq!(
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        state.control(IDENTITY)
+                    ),
+                    0
+                );
+                assert_ne!(
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        state.control(SERVER_PASSWORD)
+                    ),
+                    0
+                );
+                state.set(SERVER_PASSWORD, "disposable saved SSH password");
+                state.save().unwrap();
+                assert_eq!(state.hosts[0].authentication, Authentication::Password);
+                assert!(state.text(SERVER_PASSWORD).is_empty());
+                let original = state.hosts[0].password.clone();
+                state.select();
+                assert!(state.text(SERVER_PASSWORD).is_empty());
+                state.save().unwrap();
+                assert_eq!(state.hosts[0].password, original);
+                state.set(SERVER_PASSWORD, "replacement disposable SSH password");
+                state.save().unwrap();
+                assert_ne!(state.hosts[0].password, original);
                 assert_eq!(SendMessageW(state.control(LIST), LB_GETCOUNT, 0, 0), 1);
                 assert!(
                     !String::from_utf8_lossy(state.envelope.as_ref().unwrap())
                         .contains("confidential-test-name")
                 );
                 state.last_activity = Instant::now() - Duration::from_secs(601);
+                state.set(SERVER_PASSWORD, "unsaved password draft");
                 state.tick();
                 assert!(state.hosts.is_empty());
                 assert!(state.vault.is_none());
+                assert!(state.text(SERVER_PASSWORD).is_empty());
                 assert_eq!(SendMessageW(state.control(LIST), LB_GETCOUNT, 0, 0), 0);
             }
             {
@@ -898,6 +1089,21 @@ mod tests {
                 state.set(PASSWORD, "test passphrase with many words");
                 state.unlock().unwrap();
                 assert_eq!(state.hosts[0].name, "confidential-test-name");
+                assert_eq!(state.hosts[0].authentication, Authentication::Password);
+                state.selected = Some(0);
+                SendMessageW(state.control(LIST), LB_SETCURSEL, 0, 0);
+                state.select();
+                assert!(state.text(SERVER_PASSWORD).is_empty());
+                assert_eq!(
+                    state
+                        .vault
+                        .as_ref()
+                        .unwrap()
+                        .decrypt_password(state.hosts[0].password.as_ref().unwrap())
+                        .unwrap()
+                        .0,
+                    b"replacement disposable SSH password"
+                );
             }
             DestroyWindow(reopened);
         }
@@ -910,6 +1116,16 @@ mod tests {
                         .windows(b"confidential-test-name".len())
                         .any(|slice| slice == b"confidential-test-name")
                 );
+                for fixture in [
+                    "disposable saved SSH password",
+                    "replacement disposable SSH password",
+                    "unsaved password draft",
+                ] {
+                    let utf16: Vec<_> = fixture.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                    for secret in [fixture.as_bytes(), utf16.as_slice()] {
+                        assert!(!bytes.windows(secret.len()).any(|slice| slice == secret));
+                    }
+                }
             }
         }
     }

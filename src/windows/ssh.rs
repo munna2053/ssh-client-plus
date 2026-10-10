@@ -1,8 +1,9 @@
 use super::paths::AppPaths;
 use super::process::ConsoleProcess;
+use super::{askpass::CredentialBroker, crypto::Secret};
 use crate::{
     Result,
-    core::{Host, ReadOnlyAction},
+    core::{Authentication, Host, ReadOnlyAction},
 };
 use std::path::Path;
 
@@ -33,10 +34,6 @@ pub fn arguments(
         "-o".into(),
         "ClearAllForwardings=yes".into(),
         "-o".into(),
-        "PreferredAuthentications=publickey".into(),
-        "-o".into(),
-        "PasswordAuthentication=no".into(),
-        "-o".into(),
         "KbdInteractiveAuthentication=no".into(),
         "-o".into(),
         "ConnectTimeout=15".into(),
@@ -47,7 +44,25 @@ pub fn arguments(
         "-l".into(),
         host.username.clone(),
     ];
-    if !host.identity_path.is_empty() {
+    match host.authentication {
+        Authentication::Key => args.extend([
+            "-o".into(),
+            "PreferredAuthentications=publickey".into(),
+            "-o".into(),
+            "PasswordAuthentication=no".into(),
+        ]),
+        Authentication::Password => args.extend([
+            "-o".into(),
+            "PreferredAuthentications=password".into(),
+            "-o".into(),
+            "PasswordAuthentication=yes".into(),
+            "-o".into(),
+            "PubkeyAuthentication=no".into(),
+            "-o".into(),
+            "NumberOfPasswordPrompts=1".into(),
+        ]),
+    }
+    if host.authentication == Authentication::Key && !host.identity_path.is_empty() {
         args.extend([
             "-o".into(),
             "IdentitiesOnly=yes".into(),
@@ -65,22 +80,61 @@ pub fn arguments(
     Ok(args)
 }
 
+pub struct SshSession {
+    process: ConsoleProcess,
+    credential: Option<CredentialBroker>,
+}
+
+impl SshSession {
+    pub fn try_wait(&self) -> Result<Option<u32>> {
+        self.process.try_wait()
+    }
+    pub fn cancel_pending_credentials(&mut self) {
+        if let Some(mut credential) = self.credential.take() {
+            credential.cancel();
+        }
+    }
+}
+
 pub fn connect(
     paths: &AppPaths,
     host: &Host,
     action: Option<ReadOnlyAction>,
-) -> Result<ConsoleProcess> {
+    password: Option<Secret>,
+) -> Result<SshSession> {
     if !paths.ssh.is_file() {
         return Err("Windows OpenSSH Client is missing. Enable OpenSSH Client in Windows Settings > Optional features, then reopen SentinelSSH.".into());
     }
-    if !host.identity_path.is_empty() {
+    if host.authentication == Authentication::Key && !host.identity_path.is_empty() {
         let path = Path::new(&host.identity_path);
         if !path.is_absolute() || !path.is_file() {
             return Err("Choose an existing absolute OpenSSH identity-file path, or leave it blank to use your Windows SSH agent.".into());
         }
     }
     let args = arguments(host, &paths.known_hosts, action)?;
-    super::process::spawn_console(&paths.ssh, &args, &paths.root)
+    let credential = match (host.authentication, password) {
+        (Authentication::Key, None) => None,
+        (Authentication::Password, Some(password)) => Some(CredentialBroker::new(
+            password,
+            &std::env::current_exe().map_err(|_| "Cannot locate the SSH credential helper.")?,
+        )?),
+        _ => {
+            return Err(
+                "The selected authentication method requires a matching credential.".into(),
+            );
+        }
+    };
+    let environment = credential
+        .as_ref()
+        .map_or_else(Vec::new, CredentialBroker::environment);
+    let process = super::process::spawn_console(&paths.ssh, &args, &paths.root, &environment)?;
+    if let Some(broker) = &credential {
+        broker.authorize_parent(process.id());
+    }
+    Ok(SshSession {
+        process,
+        credential,
+    })
 }
 
 #[cfg(test)]
@@ -95,6 +149,8 @@ mod tests {
             port: 22,
             username: "deploy".into(),
             identity_path: "C:\\Keys with spaces\\id_ed25519".into(),
+            authentication: Authentication::Key,
+            password: None,
         };
         let args = arguments(
             &host,
@@ -115,6 +171,39 @@ mod tests {
             !args
                 .iter()
                 .any(|arg| arg.contains("StrictHostKeyChecking=no"))
+        );
+    }
+
+    #[test]
+    fn saved_password_login_disables_keys_and_keeps_credentials_out_of_arguments() {
+        let host = Host {
+            name: "Password login".into(),
+            address: "example.com".into(),
+            port: 22,
+            username: "deploy".into(),
+            identity_path: "C:\\unused-key".into(),
+            authentication: Authentication::Password,
+            password: Some(crate::core::SavedPassword {
+                id: [9; 16],
+                ciphertext: vec![7; 48],
+            }),
+        };
+        let args = arguments(&host, Path::new("C:\\known_hosts"), None).unwrap();
+        for option in [
+            "PreferredAuthentications=password",
+            "PasswordAuthentication=yes",
+            "PubkeyAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "NumberOfPasswordPrompts=1",
+            "StrictHostKeyChecking=ask",
+            "ForwardAgent=no",
+        ] {
+            assert!(args.iter().any(|arg| arg == option));
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "-i" || arg == &host.identity_path)
         );
     }
 }

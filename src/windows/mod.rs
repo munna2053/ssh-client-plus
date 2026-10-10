@@ -1,3 +1,4 @@
+pub mod askpass;
 pub mod crypto;
 pub mod paths;
 pub mod process;

@@ -89,7 +89,7 @@ This requires **no bundled UI framework or separately installed app-specific run
 - Running an SSH server inside the application or installing a resident agent on Linux hosts.
 - Windows, network appliances, or non-Linux managed targets.
 - Shared cloud vault, team RBAC/sync, browser client, orchestration across hundreds of hosts.
-- Full IDE features, remote root file editing, unattended privileged execution, password auto-login.
+- Full IDE features, remote root file editing, unattended privileged execution, unattended login while the vault is locked.
 - Custom SSH cipher suites, key exchange, signature algorithms, or authentication protocols.
 
 ---
@@ -218,7 +218,7 @@ Do not place passphrases in command-line arguments (`-N <passphrase>`), environm
 - Use a dedicated app-managed `known_hosts` path, or an explicit carefully documented per-user OpenSSH policy. **Never set `StrictHostKeyChecking=no`**.
 - On first connect, show fingerprint and require user verification via a trusted out-of-band source. **“Accept this unknown key” alone is trust-on-first-use, not proof of identity.**
 - On host-key change, block the connection and provide a manual investigate/replace workflow with audit entry.
-- Avoid password-based SSH sign-in in v1; key-based auth first. Never automatically enable agent forwarding.
+- Support key/agent sign-in and the owner's requested saved-password option. Encrypt server passwords under the master vault data key, retain ciphertext while unlocked, and decrypt only for a selected connection. Use a private single-use OpenSSH askpass handoff; never put passwords in arguments, environment values, or plaintext files. Never automatically enable agent forwarding.
 - Avoid root SSH logins as the default and do not silently disable server security settings.
 - Pin the executable path to the Windows OpenSSH binary, validate the local feature/version, and safely construct Win32 child-process command lines and handles.
 
@@ -401,7 +401,7 @@ Interview **8–12 Linux developers, sysadmins, and small-team operators** to va
 1. **Third-party meaning — decided:** Windows-native Rust, permitting Microsoft's API bindings and Rust standard library, while avoiding bundled application frameworks and app-installed OpenSSH binaries. See ADR 001.
 2. **Security contract:** decide whether only *encrypted-at-rest database storage* is required, or **no separate key file ever**, including passphrase-encrypted OpenSSH files. This materially changes complexity.
 3. **Initial customer:** individual developer/small infrastructure operator, not enterprise multi-user privileged-access management.
-4. **Initial Linux scope:** Ubuntu/Debian + systemd + apt, key-based OpenSSH, standard SFTP.
+4. **Initial Linux scope:** Ubuntu/Debian + systemd + apt, key/agent and encrypted saved-password OpenSSH login, standard SFTP.
 5. **MVP terminal expectation:** OS-hosted terminal acceptable for earliest internal beta; full integrated renderer required before marketing as a fully self-contained terminal.
 6. **Cloud position:** strictly offline/local-first for initial release.
 
