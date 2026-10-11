@@ -13,15 +13,18 @@ Updated: 10 October 2026. The full scope remains in [the engineering plan](../se
 - [x] Dedicated host trust file, first-use confirmation, key/agent login, and disabled forwarding.
 - [x] Saved-password login with separate vault-key encryption, on-demand decryption, and single-use private askpass handoff.
 - [x] Legacy inventory upgrade, encrypted-password edit/reopen tests, helper delivery/cancellation and caller validation.
-- [x] System/uptime/disk/memory checks with target/command confirmation and console output.
+- [x] System/uptime/disk/memory checks with target/command confirmation and embedded terminal output.
 - [x] Wrong-password, tamper, invalid-input, native UI, encrypted-artifact, and crash-recovery tests.
+- [x] Dark resizable workspace, server sidebar, and separate server details.
+- [x] ConPTY terminal with common VT rendering, keyboard, colours, copy/paste, resize, bounded history, and explicit disconnect.
+- [x] Console-attachment/input/resize/final-output/cleanup tests and hostile-output parser tests.
 - [x] Local GNU/LLVM release build; inspect imported DLLs.
 
 ## Next: complete the feasibility gate
 
 - [ ] Build and run with the complete MSVC toolchain and Windows SDK.
 - [ ] Validate login to disposable Ubuntu/Debian hosts using encrypted key files, an agent, and saved server passwords.
-- [ ] Validate console keyboard input, passphrase prompts, resize, UTF-8, and disconnection.
+- [ ] Validate embedded-terminal keyboard input, passphrase prompts, resize, Unicode, full-screen Linux tools, and disconnection against live hosts.
 - [ ] Demonstrate first-use fingerprint verification and changed-key hard failure against real hosts.
 - [ ] Prove the encrypted-vault-to-key/agent bridge and document where every usable private key exists.
 - [ ] Calibrate KDF cost on supported hardware and review secret/FFI/path ownership.
@@ -39,7 +42,7 @@ Updated: 10 October 2026. The full scope remains in [the engineering plan](../se
 
 ## Later staged features
 
-- [ ] ConPTY with a reviewed terminal renderer and hostile-output tests.
+- [ ] Independent terminal renderer review, advanced terminal compatibility, mouse reporting, and multiple sessions.
 - [ ] Package/service adapters and guarded administrative actions.
 - [ ] SFTP browse/open/save with conflict checks, backups, and permission preservation.
 - [ ] RichEdit remote-text editor and diff workflow.

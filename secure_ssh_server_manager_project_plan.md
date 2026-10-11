@@ -24,7 +24,7 @@ Build a **local-first, security-oriented desktop SSH manager** that combines an 
 
 This requires **no bundled UI framework or separately installed app-specific runtime library**. Rust's standard library and Microsoft API-binding glue are compiled into the executable; those are explicit permitted dependencies. It does **not** mean “literally no externally authored code”: OpenSSH is an open-source implementation delivered as a Windows feature. If the restriction also prohibits using OS-provided OpenSSH, there is no sensible short-path MVP: a new, independently audited SSH implementation would become the main project. **Do not write your own SSH protocol or cryptographic algorithms.** See [ADR 001](docs/ADR-001-rust-native-windows.md) for the accepted policy.
 
-**Current implementation:** native host CRUD, encrypted ESE inventory, master-passphrase/DPAPI unlock, idle/workstation/suspend lock handling, a system OpenSSH console launcher, and four fixed read-only checks. The vault stores identity-file references, not private-key material yet. Existing key files/agent identities and external console sessions remain independent of vault locking. See [README](README.md) for tested behavior and [the roadmap](docs/ROADMAP.md) for unfinished requirements.
+**Current implementation:** a dark resizable Win32 workspace, host CRUD, encrypted ESE inventory and saved server passwords, master-passphrase/DPAPI unlock, idle/workstation/suspend locks, a ConPTY-based built-in OpenSSH terminal with bounded common VT rendering, and four fixed read-only checks. The vault stores identity-file references, not private-key material yet. Locking hides the terminal and detaches user input; authenticated sessions and external agent identities remain independent of the vault key. See [README](README.md) for tested behavior and [the roadmap](docs/ROADMAP.md) for unfinished requirements.
 
 ### Product positioning
 
@@ -115,7 +115,7 @@ This requires **no bundled UI framework or separately installed app-specific run
 |---|---|---|
 | Language | **Rust (2024 edition)** with Microsoft Windows API bindings | Native executable and reusable core; ownership helps application memory safety, while Windows FFI still needs reviewed unsafe boundaries. |
 | UI | **Win32 + common controls**, RichEdit for text, DirectWrite/Direct2D if necessary | Available from Windows; macOS/Linux need separate UI adapters. |
-| Terminal process hosting | **CreateProcessW with a separate console first; ConPTY later** | The initial launcher uses a new console with its own I/O and no inherited handles. ConPTY **does not provide a terminal renderer**; ANSI/VT/xterm parsing is additional engineering. |
+| Terminal process hosting | **CreateProcessW with ConPTY** | No inherited application handles. Separate bounded input/output workers and a native GDI/common-VT renderer; advanced terminal compatibility and independent review remain. |
 | SSH operations | **OS OpenSSH**: `ssh`, `sftp`, `ssh-keygen`; optional agent | Mature cryptography/protocols; versions and agent behavior must be tested. |
 | Local database | **ESENT/ESE** native Windows database | Transactional storage with no bundled SQLite, but Windows-specific. |
 | Vault encryption | **Windows CNG AES-256-GCM**, `BCryptGenRandom`, and PBKDF2-HMAC-SHA-256 | Built-in authenticated encryption and password-derived keys. |
@@ -162,7 +162,11 @@ This requires **no bundled UI framework or separately installed app-specific run
 /src/windows/storage.rs   ESE transactions and recovery
 /src/windows/paths.rs     per-user directories and ACLs
 /src/windows/ssh.rs       OpenSSH policy and fixed remote commands
-/src/windows/process.rs   console process ownership and Windows quoting
+/src/windows/process.rs   child process ownership and Windows quoting
+/src/windows/pty.rs       ConPTY hosting and bounded worker lifecycle
+/src/terminal.rs          bounded portable VT grid and parser
+/src/windows/terminal_view.rs native terminal rendering/input
+/src/windows/theme.rs     workspace palette and DPI-scaled fonts
 /scripts/dev.ps1          local development and validation commands
 /docs                     threat model, dependency policy, architecture, roadmap
 ```

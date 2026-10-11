@@ -2,8 +2,11 @@ pub mod askpass;
 pub mod crypto;
 pub mod paths;
 pub mod process;
+pub mod pty;
 pub mod ssh;
 pub mod storage;
+pub mod terminal_view;
+pub mod theme;
 pub mod ui;
 pub mod vault;
 

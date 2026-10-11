@@ -1,4 +1,4 @@
-use super::crypto::{self, Secret};
+use super::crypto::{self, DecryptError, Secret};
 use crate::{
     Result,
     core::{
@@ -16,6 +16,44 @@ pub struct UnlockedVault {
     header: Vec<u8>,
 }
 
+/// Nonsecret envelope metadata; inspecting it never attempts a master passphrase.
+pub struct VaultMetadata {
+    pub iterations: u32,
+    pub wrapped_key_bytes: usize,
+    pub inventory_bytes: usize,
+}
+
+pub fn inspect_without_password(bytes: &[u8]) -> Result<VaultMetadata> {
+    if bytes.len() > MAX_VAULT_BYTES + 4096 {
+        return Err("Vault exceeds size limit.".into());
+    }
+    let mut reader = Reader::new(bytes);
+    if reader.take(MAGIC.len())? != MAGIC {
+        return Err("Unsupported vault header.".into());
+    }
+    let iterations = reader.u32()?;
+    reader.take(32)?;
+    let bound_len = reader.u32()? as usize;
+    if bound_len > 4096 {
+        return Err("Invalid wrapped key size.".into());
+    }
+    let bound = reader.take(bound_len)?;
+    let inventory_bytes = bytes
+        .len()
+        .checked_sub(MAGIC.len() + 4 + 32 + 4 + bound_len)
+        .ok_or("Truncated vault header.")?;
+    let wrapped = crypto::dpapi(bound, true)?;
+    if wrapped.len() != 60 || inventory_bytes < 42 || !(600_000..=10_000_000).contains(&iterations)
+    {
+        return Err("Unexpected vault envelope dimensions or KDF parameters.".into());
+    }
+    Ok(VaultMetadata {
+        iterations,
+        wrapped_key_bytes: wrapped.len(),
+        inventory_bytes,
+    })
+}
+
 impl UnlockedVault {
     pub fn encrypt_password(&self, password: &Secret) -> Result<SavedPassword> {
         validate_password(password)?;
@@ -29,7 +67,10 @@ impl UnlockedVault {
             &self.data_key,
             &password_aad(&password.id),
             &password.ciphertext,
-        )?;
+        ).map_err(|error| match error {
+            DecryptError::Authentication => "Saved server password failed authentication. Its encrypted record may be damaged; replace the saved password. [SSH_PASSWORD_AUTH]".to_string(),
+            other => format!("Cannot decrypt the saved server password: {other}"),
+        })?;
         validate_password(&decrypted)?;
         Ok(decrypted)
     }
@@ -71,13 +112,21 @@ impl UnlockedVault {
         let bound = reader.take(bound_len)?;
         let kek = crypto::derive(password, salt, iterations)?;
         let wrapped = crypto::dpapi(bound, true)?;
-        let data_key = crypto::decrypt(&kek, &bytes[..aad_end], &wrapped)?;
+        let data_key = crypto::decrypt(&kek, &bytes[..aad_end], &wrapped).map_err(|error| match error {
+            DecryptError::Authentication => "Master passphrase could not verify the vault key. Check the original vault passphrase, keyboard layout, and spaces. The encrypted key/header may also be damaged. [VAULT_KEY_AUTH]".to_string(),
+            other => format!("Cannot decrypt the vault key: {other}"),
+        })?;
         if data_key.0.len() != 32 {
             return Err("Invalid vault data key.".into());
         }
         let header_end = aad_end + 4 + bound_len;
-        let plaintext = crypto::decrypt(&data_key, HOST_AAD, &bytes[header_end..])?;
-        let hosts = decode_hosts(&plaintext.0)?;
+        let plaintext = crypto::decrypt(&data_key, HOST_AAD, &bytes[header_end..]).map_err(|error| match error {
+            DecryptError::Authentication => "Master passphrase verified, but the saved inventory failed authentication. Keep the database and logs for recovery. [VAULT_DATA_AUTH]".to_string(),
+            other => format!("Vault key verified, but inventory decryption failed: {other}"),
+        })?;
+        let hosts = decode_hosts(&plaintext.0).map_err(|error| {
+            format!("Vault key verified, but the saved inventory format is invalid: {error}")
+        })?;
         Ok((
             Self {
                 data_key,
@@ -125,7 +174,14 @@ mod tests {
         let password = Secret(b"a long test master passphrase".to_vec());
         let vault = UnlockedVault::create(&password).unwrap();
         let bytes = vault.seal(&[]).unwrap();
-        assert!(UnlockedVault::unlock(&Secret(b"incorrect passphrase".to_vec()), &bytes).is_err());
+        let metadata = inspect_without_password(&bytes).unwrap();
+        assert_eq!(metadata.iterations, ITERATIONS);
+        assert_eq!(metadata.wrapped_key_bytes, 60);
+        assert!(inspect_without_password(&bytes[..vault.header.len()]).is_err());
+        let wrong = UnlockedVault::unlock(&Secret(b"incorrect passphrase".to_vec()), &bytes)
+            .err()
+            .unwrap();
+        assert!(wrong.contains("[VAULT_KEY_AUTH]"));
         assert!(
             UnlockedVault::unlock(&password, &bytes)
                 .unwrap()
@@ -134,10 +190,28 @@ mod tests {
         );
         let mut modified = bytes.clone();
         *modified.last_mut().unwrap() ^= 1;
-        assert!(UnlockedVault::unlock(&password, &modified).is_err());
+        let damaged = UnlockedVault::unlock(&password, &modified).err().unwrap();
+        assert!(damaged.contains("[VAULT_DATA_AUTH]"));
         let mut unsupported = bytes;
         unsupported[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(UnlockedVault::unlock(&password, &unsupported).is_err());
+    }
+
+    #[test]
+    fn original_key_only_vault_unlocks_and_resaves_with_the_same_master_key() {
+        let password = Secret(b"legacy master passphrase fixture".to_vec());
+        let vault = UnlockedVault::create(&password).unwrap();
+        let mut legacy = vault.header.clone();
+        legacy
+            .extend(crypto::encrypt(&vault.data_key, HOST_AAD, b"SSH-HOSTS\x01\0\0\0\0").unwrap());
+        let (unlocked, hosts) = UnlockedVault::unlock(&password, &legacy).unwrap();
+        assert!(hosts.is_empty());
+        let upgraded = unlocked.seal(&hosts).unwrap();
+        assert_eq!(
+            &legacy[..vault.header.len()],
+            &upgraded[..vault.header.len()]
+        );
+        assert!(UnlockedVault::unlock(&password, &upgraded).is_ok());
     }
 
     #[test]

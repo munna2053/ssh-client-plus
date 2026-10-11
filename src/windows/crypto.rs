@@ -3,7 +3,37 @@ use std::{
     ptr::{null, null_mut},
     sync::atomic::{Ordering, compiler_fence},
 };
-use windows_sys::Win32::{Foundation::LocalFree, Security::Cryptography::*};
+use windows_sys::Win32::{
+    Foundation::{LocalFree, STATUS_AUTH_TAG_MISMATCH},
+    Security::Cryptography::*,
+};
+
+#[derive(Debug)]
+pub enum DecryptError {
+    Authentication,
+    Other(String),
+}
+
+impl std::fmt::Display for DecryptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authentication => formatter.write_str("Encrypted record authentication failed."),
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for DecryptError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for DecryptError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
+    }
+}
 
 /// Best-effort clearing of buffers owned by this application; no Debug/Clone.
 pub struct Secret(pub Vec<u8>);
@@ -110,7 +140,7 @@ fn aes(
     input: &[u8],
     tag: &mut [u8; 16],
     decrypt: bool,
-) -> Result<Secret> {
+) -> std::result::Result<Secret, DecryptError> {
     if key_bytes.0.len() != 32 || nonce.len() != 12 || input.len() > crate::core::MAX_VAULT_BYTES {
         return Err("Invalid encryption parameters.".into());
     }
@@ -182,10 +212,17 @@ fn aes(
             0,
         )
     };
-    if code < 0 && decrypt {
-        return Err("Unlock failed: wrong passphrase or damaged vault data.".into());
+    if code == STATUS_AUTH_TAG_MISMATCH && decrypt {
+        return Err(DecryptError::Authentication);
     }
-    status(code, "Encrypt vault data")?;
+    status(
+        code,
+        if decrypt {
+            "Decrypt vault data"
+        } else {
+            "Encrypt vault data"
+        },
+    )?;
     if written as usize != input.len() {
         return Err("Unexpected encrypted record length.".into());
     }
@@ -196,7 +233,8 @@ fn aes(
 pub fn encrypt(key: &Secret, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let nonce = random::<12>()?;
     let mut tag = [0; 16];
-    let cipher = aes(key, &nonce, aad, plaintext, &mut tag, false)?;
+    let cipher =
+        aes(key, &nonce, aad, plaintext, &mut tag, false).map_err(|error| error.to_string())?;
     let mut envelope = Vec::with_capacity(28 + cipher.0.len());
     envelope.extend_from_slice(&nonce);
     envelope.extend_from_slice(&tag);
@@ -204,7 +242,11 @@ pub fn encrypt(key: &Secret, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(envelope)
 }
 
-pub fn decrypt(key: &Secret, aad: &[u8], envelope: &[u8]) -> Result<Secret> {
+pub fn decrypt(
+    key: &Secret,
+    aad: &[u8],
+    envelope: &[u8],
+) -> std::result::Result<Secret, DecryptError> {
     if envelope.len() < 28 {
         return Err("Truncated encrypted record.".into());
     }
@@ -272,7 +314,14 @@ mod tests {
             assert!(decrypt(&key, b"host-record-v1", &modified).is_err());
         }
         assert!(decrypt(&key, b"different-record", &envelope).is_err());
-        assert!(decrypt(&Secret(vec![7; 32]), b"host-record-v1", &envelope).is_err());
+        assert!(matches!(
+            decrypt(&Secret(vec![7; 32]), b"host-record-v1", &envelope),
+            Err(DecryptError::Authentication)
+        ));
+        assert!(matches!(
+            decrypt(&Secret(vec![7; 31]), b"host-record-v1", &envelope),
+            Err(DecryptError::Other(_))
+        ));
         assert_ne!(
             &envelope[..12],
             &encrypt(&key, b"host-record-v1", b"confidential server").unwrap()[..12]

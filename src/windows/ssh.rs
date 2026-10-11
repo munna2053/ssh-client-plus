@@ -1,5 +1,5 @@
 use super::paths::AppPaths;
-use super::process::ConsoleProcess;
+use super::pty::PtyProcess;
 use super::{askpass::CredentialBroker, crypto::Secret};
 use crate::{
     Result,
@@ -70,22 +70,32 @@ pub fn arguments(
             host.identity_path.clone(),
         ]);
     }
-    if action.is_some() {
-        args.push("-tt".into());
-    }
+    args.push("-tt".into());
     args.push(host.address.clone());
     if let Some(action) = action {
-        args.push(format!("{}; sentinel_status=$?; printf '\\nExit code: %s\\nPress Enter to close. ' \"$sentinel_status\"; read -r sentinel_reply; exit \"$sentinel_status\"", action.command()));
+        args.push(format!("{}; sentinel_status=$?; printf '\\nExit code: %s\\n' \"$sentinel_status\"; exit \"$sentinel_status\"", action.command()));
     }
     Ok(args)
 }
 
 pub struct SshSession {
-    process: ConsoleProcess,
+    process: PtyProcess,
     credential: Option<CredentialBroker>,
 }
 
 impl SshSession {
+    pub fn input(&self) -> std::sync::mpsc::SyncSender<Secret> {
+        self.process.input()
+    }
+    pub fn resize(&self, columns: usize, rows: usize) -> Result<()> {
+        self.process.resize(columns, rows)
+    }
+    pub fn output(&self) -> Vec<Vec<u8>> {
+        self.process.output()
+    }
+    pub fn finish_output(&mut self) -> Vec<Vec<u8>> {
+        self.process.finish_output()
+    }
     pub fn try_wait(&self) -> Result<Option<u32>> {
         self.process.try_wait()
     }
@@ -101,6 +111,7 @@ pub fn connect(
     host: &Host,
     action: Option<ReadOnlyAction>,
     password: Option<Secret>,
+    size: (usize, usize),
 ) -> Result<SshSession> {
     if !paths.ssh.is_file() {
         return Err("Windows OpenSSH Client is missing. Enable OpenSSH Client in Windows Settings > Optional features, then reopen SentinelSSH.".into());
@@ -124,10 +135,11 @@ pub fn connect(
             );
         }
     };
-    let environment = credential
+    let mut environment = credential
         .as_ref()
         .map_or_else(Vec::new, CredentialBroker::environment);
-    let process = super::process::spawn_console(&paths.ssh, &args, &paths.root, &environment)?;
+    environment.push(("TERM".into(), "xterm-256color".into()));
+    let process = super::pty::spawn(&paths.ssh, &args, &paths.root, &environment, size.0, size.1)?;
     if let Some(broker) = &credential {
         broker.authorize_parent(process.id());
     }

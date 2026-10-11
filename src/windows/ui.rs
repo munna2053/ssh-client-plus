@@ -2,6 +2,10 @@ use super::{
     crypto::Secret, paths::AppPaths, ssh::SshSession, storage::RecordStore, vault::UnlockedVault,
     wide,
 };
+use super::{
+    terminal_view,
+    theme::{self, Theme},
+};
 use crate::{
     Result,
     core::{Authentication, Host, ReadOnlyAction},
@@ -12,16 +16,25 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    Graphics::Gdi::{COLOR_WINDOW, DEFAULT_GUI_FONT, GetStockObject},
-    System::{LibraryLoader::GetModuleHandleW, RemoteDesktop::*},
-    UI::{Controls::*, Input::KeyboardAndMouse::EnableWindow, WindowsAndMessaging::*},
+    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Graphics::{
+        Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
+        Gdi::*,
+    },
+    System::{LibraryLoader::GetModuleHandleW, RemoteDesktop::*, SystemServices::SS_ENDELLIPSIS},
+    UI::{
+        Controls::*,
+        HiDpi::*,
+        Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus},
+        WindowsAndMessaging::*,
+    },
 };
 
 const PASSWORD: usize = 101;
 const CONFIRM: usize = 102;
 const UNLOCK: usize = 103;
 const LOCK: usize = 104;
+const SHOW_MASTER: usize = 105;
 const LIST: usize = 110;
 const NAME: usize = 111;
 const ADDRESS: usize = 112;
@@ -40,6 +53,14 @@ const DISK: usize = 132;
 const MEMORY: usize = 133;
 const STATUS: usize = 140;
 const IDENTITY_NOTE: usize = 141;
+const TERMINAL: usize = 150;
+const TAB_TERMINAL: usize = 151;
+const TAB_DETAILS: usize = 152;
+const DISCONNECT: usize = 153;
+const ACTIVE_TITLE: usize = 154;
+const TERMINAL_HINT: usize = 155;
+const LIST_HINT: usize = 156;
+const VAULT_BADGE: usize = 157;
 
 struct State {
     paths: AppPaths,
@@ -53,6 +74,10 @@ struct State {
     retry_after: Instant,
     failures: u32,
     children: Vec<SshSession>,
+    window: HWND,
+    theme: Theme,
+    details: bool,
+    active_label: String,
 }
 
 impl State {
@@ -71,6 +96,10 @@ impl State {
             retry_after: Instant::now(),
             failures: 0,
             children: vec![],
+            window: null_mut(),
+            theme: Theme::new(96)?,
+            details: false,
+            active_label: String::new(),
         })
     }
 
@@ -114,129 +143,125 @@ impl State {
         }
         // SAFETY: DEFAULT_GUI_FONT is an OS-owned stock font; control handles are valid.
         unsafe {
-            SendMessageW(
-                handle,
-                WM_SETFONT,
-                GetStockObject(DEFAULT_GUI_FONT) as usize,
-                1,
-            );
+            SendMessageW(handle, WM_SETFONT, self.theme.body.0 as usize, 1);
         }
         self.controls.push((id, handle));
         Ok(())
     }
 
     fn initialize(&mut self, window: HWND) -> Result<()> {
-        let edit = WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32;
-        let button = WS_TABSTOP | BS_PUSHBUTTON as u32;
-        self.add(window, "STATIC", "SentinelSSH", 201, 0, [24, 18, 550, 26])?;
-        self.add(
-            window,
-            "STATIC",
-            "Local encrypted inventory  |  Windows OpenSSH",
-            202,
-            0,
-            [24, 50, 850, 24],
-        )?;
-        self.add(
-            window,
-            "STATIC",
-            "Master passphrase",
-            203,
-            0,
-            [24, 90, 170, 22],
-        )?;
-        self.add(
-            window,
-            "EDIT",
-            "",
-            PASSWORD,
-            edit | ES_PASSWORD as u32,
-            [200, 86, 340, 28],
-        )?;
-        self.add(
-            window,
-            "STATIC",
-            "Confirm on first setup",
-            204,
-            0,
-            [24, 128, 170, 22],
-        )?;
-        self.add(
-            window,
-            "EDIT",
-            "",
-            CONFIRM,
-            edit | ES_PASSWORD as u32,
-            [200, 124, 340, 28],
-        )?;
-        self.add(window, "BUTTON", "", UNLOCK, button, [558, 86, 164, 30])?;
+        self.window = window;
+        // SAFETY: live window has a valid DPI; theme resources are attached before any controls use them.
+        self.theme = Theme::new(unsafe { GetDpiForWindow(window) }.max(96))?;
+        let edit = WS_TABSTOP | ES_AUTOHSCROLL as u32;
+        let button = WS_TABSTOP | BS_OWNERDRAW as u32;
+        for (id, text) in [
+            (200, "SentinelSSH"),
+            (202, "Your private server workspace"),
+            (205, "SERVERS"),
+            (206, "Select a server"),
+            (207, "Add a server or choose one from the sidebar."),
+            (203, "Vault master passphrase"),
+            (204, "Confirm passphrase"),
+            (208, "Unlock your workspace"),
+            (
+                209,
+                "Your servers and saved passwords are protected by your vault key.",
+            ),
+            (220, "QUICK CHECKS"),
+            (ACTIVE_TITLE, "No active session"),
+            (
+                TERMINAL_HINT,
+                "Ctrl+Shift+C to copy   |   Ctrl+Shift+V to paste   |   Scroll for history",
+            ),
+            (LIST_HINT, "Unlock your vault to load servers."),
+            (VAULT_BADGE, "VAULT LOCKED"),
+            (STATUS, ""),
+        ] {
+            self.add(
+                window,
+                "STATIC",
+                text,
+                id,
+                if matches!(id, 206 | 207 | ACTIVE_TITLE) {
+                    SS_ENDELLIPSIS
+                } else {
+                    0
+                },
+                [0, 0, 1, 1],
+            )?;
+        }
+        for (id, label) in [
+            (NAME, "Display name"),
+            (ADDRESS, "Hostname / IP"),
+            (PORT, "SSH port"),
+            (USERNAME, "Username"),
+            (IDENTITY, "Identity file path"),
+            (SERVER_PASSWORD, "Server password"),
+        ] {
+            self.add(window, "STATIC", label, id + 300, 0, [0, 0, 1, 1])?;
+            self.add(
+                window,
+                "EDIT",
+                "",
+                id,
+                edit | if id == SERVER_PASSWORD {
+                    ES_PASSWORD as u32
+                } else {
+                    0
+                },
+                [0, 0, 1, 1],
+            )?;
+        }
+        self.add(window, "STATIC", "Login method", 416, 0, [0, 0, 1, 1])?;
+        self.add(window, "STATIC", "", IDENTITY_NOTE, 0, [0, 0, 1, 1])?;
+        for id in [PASSWORD, CONFIRM] {
+            self.add(
+                window,
+                "EDIT",
+                "",
+                id,
+                edit | ES_PASSWORD as u32,
+                [0, 0, 1, 1],
+            )?;
+        }
         self.add(
             window,
             "BUTTON",
-            "Lock vault",
-            LOCK,
-            button,
-            [740, 86, 128, 30],
+            "Show master passphrase",
+            SHOW_MASTER,
+            WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+            [0, 0, 1, 1],
         )?;
-        self.add(
-            window,
-            "STATIC",
-            "Saved servers",
-            205,
-            0,
-            [24, 185, 300, 22],
-        )?;
+        for (id, label) in [
+            (UNLOCK, "Unlock vault"),
+            (LOCK, "Lock vault"),
+            (NEW, "+ New server"),
+            (DELETE, "Delete"),
+            (SAVE, "Save server"),
+            (CONNECT, "Connect"),
+            (DISCONNECT, "Disconnect"),
+            (TAB_TERMINAL, "Terminal"),
+            (TAB_DETAILS, "Server details"),
+            (SYSTEM, "System"),
+            (UPTIME, "Uptime"),
+            (DISK, "Disk"),
+            (MEMORY, "Memory"),
+        ] {
+            self.add(window, "BUTTON", label, id, button, [0, 0, 1, 1])?;
+        }
         self.add(
             window,
             "LISTBOX",
             "",
             LIST,
-            WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY as u32,
-            [24, 215, 310, 341],
-        )?;
-        self.add(
-            window,
-            "BUTTON",
-            "New server",
-            NEW,
-            button,
-            [24, 576, 144, 30],
-        )?;
-        self.add(
-            window,
-            "BUTTON",
-            "Delete",
-            DELETE,
-            button,
-            [184, 576, 150, 30],
-        )?;
-        for (index, (id, label)) in [
-            (NAME, "Display name"),
-            (ADDRESS, "Hostname / IP"),
-            (PORT, "SSH port"),
-            (USERNAME, "Linux username"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let y = 218 + index as i32 * 44;
-            self.add(
-                window,
-                "STATIC",
-                label,
-                210 + index,
-                0,
-                [360, y + 4, 142, 22],
-            )?;
-            self.add(window, "EDIT", "", id, edit, [508, y, 360, 28])?;
-        }
-        self.add(
-            window,
-            "STATIC",
-            "Login method",
-            215,
-            0,
-            [360, 398, 142, 22],
+            WS_VSCROLL
+                | WS_TABSTOP
+                | LBS_NOTIFY as u32
+                | LBS_OWNERDRAWFIXED as u32
+                | LBS_HASSTRINGS as u32
+                | LBS_NOINTEGRALHEIGHT as u32,
+            [0, 0, 1, 1],
         )?;
         self.add(
             window,
@@ -244,9 +269,11 @@ impl State {
             "",
             AUTHENTICATION,
             WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
-            [508, 394, 360, 150],
+            [0, 0, 1, 1],
         )?;
-        // SAFETY: live combo copies each string; zero selects the key login default.
+        let terminal = terminal_view::create(window, TERMINAL)?;
+        self.controls.push((TERMINAL, terminal));
+        // SAFETY: controls exist; native messages copy the input strings synchronously.
         unsafe {
             for label in ["SSH key / agent", "Saved password"] {
                 let label = wide(label);
@@ -258,93 +285,48 @@ impl State {
                 );
             }
             SendMessageW(self.control(AUTHENTICATION), CB_SETCURSEL, 0, 0);
-        }
-        self.add(
-            window,
-            "STATIC",
-            "Identity file path",
-            216,
-            0,
-            [360, 442, 142, 22],
-        )?;
-        self.add(window, "EDIT", "", IDENTITY, edit, [508, 438, 360, 28])?;
-        self.add(
-            window,
-            "STATIC",
-            "Server password",
-            217,
-            0,
-            [360, 486, 142, 22],
-        )?;
-        self.add(
-            window,
-            "EDIT",
-            "",
-            SERVER_PASSWORD,
-            edit | ES_PASSWORD as u32,
-            [508, 482, 360, 28],
-        )?;
-        self.add(
-            window,
-            "STATIC",
-            "Use a passphrase-protected OpenSSH key. Blank path uses your Windows SSH agent.",
-            IDENTITY_NOTE,
-            0,
-            [360, 520, 508, 44],
-        )?;
-        self.add(
-            window,
-            "BUTTON",
-            "Save server",
-            SAVE,
-            button,
-            [508, 576, 162, 30],
-        )?;
-        self.add(
-            window,
-            "BUTTON",
-            "Open SSH terminal",
-            CONNECT,
-            button,
-            [690, 576, 178, 30],
-        )?;
-        self.add(
-            window,
-            "STATIC",
-            "Read-only checks (select a saved server)",
-            220,
-            0,
-            [24, 626, 800, 22],
-        )?;
-        for (index, (id, text)) in [
-            (SYSTEM, "System info"),
-            (UPTIME, "Uptime"),
-            (DISK, "Disk usage"),
-            (MEMORY, "Memory"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            self.add(
-                window,
-                "BUTTON",
-                text,
-                id,
-                button,
-                [24 + index as i32 * 213, 660, 194, 30],
-            )?;
-        }
-        self.add(window, "STATIC", "", STATUS, 0, [24, 710, 844, 65])?;
-        // SAFETY: each edit control exists and supports EM_SETLIMITTEXT.
-        unsafe {
-            SendMessageW(self.control(PASSWORD), EM_SETLIMITTEXT, 1024, 0);
-            SendMessageW(self.control(CONFIRM), EM_SETLIMITTEXT, 1024, 0);
+            SendMessageW(
+                self.control(LIST),
+                LB_SETITEMHEIGHT,
+                0,
+                theme::scale(58, self.theme.dpi) as isize,
+            );
+            for id in [PASSWORD, CONFIRM] {
+                SendMessageW(self.control(id), EM_SETLIMITTEXT, 1024, 0);
+            }
             SendMessageW(self.control(SERVER_PASSWORD), EM_SETLIMITTEXT, 1022, 0);
             for id in [NAME, ADDRESS, PORT, USERNAME, IDENTITY] {
                 SendMessageW(self.control(id), EM_SETLIMITTEXT, 2048, 0);
             }
-            if SetTimer(window, 1, 1000, None) == 0 {
-                return Err("Cannot start the vault idle-lock timer.".into());
+            for id in [
+                PASSWORD,
+                CONFIRM,
+                NAME,
+                ADDRESS,
+                PORT,
+                USERNAME,
+                IDENTITY,
+                SERVER_PASSWORD,
+            ] {
+                let margin = theme::scale(10, self.theme.dpi) as usize;
+                SendMessageW(
+                    self.control(id),
+                    EM_SETMARGINS,
+                    (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
+                    (margin | (margin << 16)) as isize,
+                );
+            }
+            for id in [200, 208] {
+                SendMessageW(self.control(id), WM_SETFONT, self.theme.title.0 as usize, 1);
+            }
+            SendMessageW(
+                self.control(206),
+                WM_SETFONT,
+                self.theme.heading.0 as usize,
+                1,
+            );
+            if SetTimer(window, 1, 50, None) == 0 {
+                return Err("Cannot start the workspace refresh timer.".into());
             }
             if WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) == 0 {
                 return Err("Cannot register vault lock notifications with Windows.".into());
@@ -358,8 +340,24 @@ impl State {
                 "Create vault"
             },
         );
+        self.set(
+            208,
+            if self.envelope.is_some() {
+                "Unlock your workspace"
+            } else {
+                "Create your private vault"
+            },
+        );
         self.refresh_enabled();
-        self.set(STATUS, if self.paths.ssh.is_file() { "Windows OpenSSH detected. Unlock your vault to manage servers. First connections ask you to verify the host fingerprint in the SSH console." } else { "Windows OpenSSH Client was not found. Enable it in Windows Settings > Optional features. You can still set up the host vault." });
+        self.layout();
+        self.set(
+            STATUS,
+            if self.paths.ssh.is_file() {
+                "Ready. Unlock your vault to connect to a server."
+            } else {
+                "OpenSSH Client is missing. Enable it in Windows Settings > Optional features."
+            },
+        );
         Ok(())
     }
 
@@ -369,6 +367,364 @@ impl State {
         unsafe {
             SetWindowTextW(self.control(id), value.as_ptr());
         }
+    }
+
+    fn bounds(&self) -> (i32, i32) {
+        let mut rect = RECT::default();
+        // SAFETY: the state belongs to this live parent window.
+        unsafe {
+            GetClientRect(self.window, &mut rect);
+        }
+        (
+            rect.right * 96 / self.theme.dpi as i32,
+            rect.bottom * 96 / self.theme.dpi as i32,
+        )
+    }
+
+    fn place(&self, id: usize, x: i32, y: i32, width: i32, height: i32) {
+        let s = |v| theme::scale(v, self.theme.dpi);
+        // SAFETY: this live child is owned by the window; all dimensions are scaled scalar values.
+        unsafe {
+            MoveWindow(
+                self.control(id),
+                s(x),
+                s(y),
+                s(width.max(1)),
+                s(height.max(1)),
+                0,
+            );
+        }
+    }
+
+    fn visible(&self, id: usize, visible: bool) {
+        // SAFETY: handle is an owned child. Showing a child does not activate the top-level window.
+        unsafe {
+            ShowWindow(self.control(id), if visible { SW_SHOWNA } else { SW_HIDE });
+        }
+    }
+
+    fn workspace_labels(&self) {
+        let unlocked = self.vault.is_some();
+        self.set(
+            VAULT_BADGE,
+            if unlocked {
+                "VAULT UNLOCKED"
+            } else {
+                "VAULT LOCKED"
+            },
+        );
+        self.set(
+            LIST_HINT,
+            if !unlocked {
+                "Unlock to see your servers."
+            } else {
+                "No servers yet.\r\nAdd your first server below."
+            },
+        );
+        if let Some(host) = self.selected.and_then(|index| self.hosts.get(index)) {
+            self.set(206, &host.name);
+            self.set(
+                207,
+                &format!("{}@{}:{}", host.username, host.address, host.port),
+            );
+        } else {
+            self.set(
+                206,
+                if self.details {
+                    "New server"
+                } else {
+                    "Select a server"
+                },
+            );
+            self.set(207, "Add a server or choose one from the sidebar.");
+        }
+        self.set(
+            ACTIVE_TITLE,
+            if self.children.is_empty() {
+                "No active session"
+            } else {
+                &self.active_label
+            },
+        );
+    }
+
+    fn layout(&self) {
+        let (width, height) = self.bounds();
+        let unlocked = self.vault.is_some();
+        let left = 338;
+        let main = (width - left - 24).max(220);
+        self.place(200, 72, 13, 300, 34);
+        self.place(202, 72, 48, 410, 22);
+        self.place(LOCK, width - 158, 24, 134, 34);
+        self.place(VAULT_BADGE, width - 352, 32, 178, 23);
+        self.place(205, 36, 110, 240, 22);
+        self.place(LIST, 32, 148, 268, (height - 386).max(70));
+        self.place(LIST_HINT, 48, 175, 232, 70);
+        self.visible(LIST_HINT, self.hosts.is_empty());
+        self.place(220, 36, height - 218, 240, 20);
+        for (id, x, y) in [
+            (SYSTEM, 32, height - 188),
+            (UPTIME, 172, height - 188),
+            (DISK, 32, height - 147),
+            (MEMORY, 172, height - 147),
+            (NEW, 32, height - 104),
+            (DELETE, 172, height - 104),
+        ] {
+            self.place(id, x, y, 128, 34);
+        }
+        self.place(STATUS, 24, height - 49, width - 48, 40);
+        self.place(206, left, 106, main - 265, 28);
+        self.place(207, left, 139, main - 265, 22);
+        self.place(CONNECT, width - 277, 112, 139, 38);
+        self.place(DISCONNECT, width - 128, 112, 104, 38);
+        self.place(TAB_TERMINAL, left, 176, 103, 32);
+        self.place(TAB_DETAILS, left + 112, 176, 130, 32);
+        self.place(ACTIVE_TITLE, left + 260, 184, main - 260, 22);
+        self.place(TERMINAL, left, 224, main, height - 312);
+        self.place(TERMINAL_HINT, left, height - 79, main, 23);
+        for id in [
+            206,
+            207,
+            CONNECT,
+            DISCONNECT,
+            TAB_TERMINAL,
+            TAB_DETAILS,
+            ACTIVE_TITLE,
+        ] {
+            self.visible(id, unlocked);
+        }
+        self.visible(TERMINAL, unlocked && !self.details);
+        self.visible(TERMINAL_HINT, unlocked && !self.details);
+        let form = main.min(760);
+        let step = ((height - 385) / 5).clamp(49, 68);
+        for (id, x, y, w) in [
+            (NAME, left, 225, form),
+            (ADDRESS, left, 225 + step, form - 120),
+            (PORT, left + form - 102, 225 + step, 102),
+            (USERNAME, left, 225 + step * 2, form / 2 - 10),
+            (IDENTITY, left, 225 + step * 3, form),
+            (SERVER_PASSWORD, left, 225 + step * 4, form),
+        ] {
+            self.place(id + 300, x, y, w, 20);
+            self.place(id, x, y + 23, w, 26);
+            self.visible(id + 300, unlocked && self.details);
+            self.visible(id, unlocked && self.details);
+        }
+        self.place(416, left + form / 2 + 10, 225 + step * 2, form / 2 - 10, 20);
+        self.place(
+            AUTHENTICATION,
+            left + form / 2 + 10,
+            248 + step * 2,
+            form / 2 - 10,
+            160,
+        );
+        self.place(IDENTITY_NOTE, left, 278 + step * 4, form, 33);
+        self.place(SAVE, left, 320 + step * 4, 146, 34);
+        for id in [416, AUTHENTICATION, IDENTITY_NOTE, SAVE] {
+            self.visible(id, unlocked && self.details);
+        }
+        let card_width = main.min(580);
+        let card_x = left + (main - card_width) / 2;
+        let creating = self.envelope.is_none();
+        let card_height = if creating { 342 } else { 270 };
+        let card_y = ((height - card_height) / 2).max(118);
+        self.place(208, card_x, card_y, card_width, 40);
+        self.place(203, card_x, card_y + 66, card_width, 23);
+        self.place(PASSWORD, card_x, card_y + 95, card_width, 36);
+        self.place(204, card_x, card_y + 144, card_width, 23);
+        self.place(CONFIRM, card_x, card_y + 171, card_width, 36);
+        let extra = if creating { 76 } else { 0 };
+        self.place(SHOW_MASTER, card_x, card_y + 145 + extra, card_width, 25);
+        self.place(UNLOCK, card_x, card_y + 184 + extra, card_width, 38);
+        self.place(209, card_x, card_y + 235 + extra, card_width, 48);
+        for id in [208, 203, PASSWORD, SHOW_MASTER, UNLOCK, 209] {
+            self.visible(id, !unlocked);
+        }
+        for id in [204, CONFIRM] {
+            self.visible(id, !unlocked && creating);
+        }
+        self.workspace_labels();
+        // SAFETY: repaint is deferred, avoiding synchronous mutable state reentry during layout.
+        unsafe {
+            InvalidateRect(self.window, null(), 0);
+            for &(_, control) in &self.controls {
+                InvalidateRect(control, null(), 1);
+            }
+        }
+    }
+
+    fn paint(&self) {
+        // SAFETY: painting is paired; the DC is borrowed only during this callback.
+        unsafe {
+            let mut paint = PAINTSTRUCT::default();
+            let dc = BeginPaint(self.window, &mut paint);
+            self.render(dc);
+            EndPaint(self.window, &paint);
+        }
+    }
+
+    fn render(&self, dc: HDC) {
+        // SAFETY: paint/print callbacks supply a live DC; state resources remain owned during drawing.
+        unsafe {
+            let mut client = RECT::default();
+            GetClientRect(self.window, &mut client);
+            FillRect(dc, &client, self.theme.canvas.0);
+            let (width, height) = self.bounds();
+            let s = |v| theme::scale(v, self.theme.dpi);
+            let rect = |x, y, w, h| RECT {
+                left: s(x),
+                top: s(y),
+                right: s(x + w),
+                bottom: s(y + h),
+            };
+            theme::rounded(dc, &rect(20, 94, 292, height - 154), theme::PANEL, s(16));
+            theme::rounded(dc, &rect(24, 22, 33, 33), theme::ACCENT, s(10));
+            theme::text(
+                dc,
+                rect(24, 22, 33, 33),
+                ">_",
+                self.theme.body.0,
+                theme::TEXT,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            theme::fill(dc, &rect(24, height - 60, width - 48, 1), theme::BORDER);
+            if self.vault.is_some() && !self.details {
+                theme::rounded(
+                    dc,
+                    &rect(337, 223, width - 360, height - 310),
+                    theme::BORDER,
+                    s(8),
+                );
+            }
+        }
+    }
+
+    fn draw_item(&self, item: &DRAWITEMSTRUCT) {
+        let dc = item.hDC;
+        let id = item.CtlID as usize;
+        let s = |v| theme::scale(v, self.theme.dpi);
+        if id == LIST {
+            theme::fill(dc, &item.rcItem, theme::PANEL);
+            let Some(host) = self.hosts.get(item.itemID as usize) else {
+                return;
+            };
+            let chosen = item.itemState & ODS_SELECTED != 0;
+            if chosen {
+                theme::rounded(dc, &item.rcItem, theme::SELECTED, s(10));
+            }
+            let rect = item.rcItem;
+            if chosen {
+                theme::rounded(
+                    dc,
+                    &RECT {
+                        left: rect.left + s(3),
+                        top: rect.top + s(12),
+                        right: rect.left + s(6),
+                        bottom: rect.bottom - s(12),
+                    },
+                    theme::ACCENT,
+                    s(3),
+                );
+            }
+            theme::text(
+                dc,
+                RECT {
+                    left: rect.left + s(16),
+                    top: rect.top + s(7),
+                    right: rect.right - s(10),
+                    bottom: rect.top + s(29),
+                },
+                &host.name,
+                self.theme.body.0,
+                theme::TEXT,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            theme::text(
+                dc,
+                RECT {
+                    left: rect.left + s(16),
+                    top: rect.top + s(30),
+                    right: rect.right - s(10),
+                    bottom: rect.bottom - s(4),
+                },
+                &format!("{}@{}:{}", host.username, host.address, host.port),
+                self.theme.body.0,
+                theme::MUTED,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        } else {
+            let disabled = item.itemState & ODS_DISABLED != 0;
+            let primary = matches!(id, UNLOCK | CONNECT | SAVE)
+                || (id == TAB_TERMINAL && !self.details)
+                || (id == TAB_DETAILS && self.details);
+            let background = if disabled {
+                theme::PANEL
+            } else if item.itemState & ODS_SELECTED != 0 {
+                theme::SELECTED
+            } else if primary {
+                theme::ACCENT
+            } else {
+                theme::INPUT
+            };
+            theme::fill(
+                dc,
+                &item.rcItem,
+                if matches!(id, NEW | DELETE | SYSTEM | UPTIME | DISK | MEMORY) {
+                    theme::PANEL
+                } else {
+                    theme::CANVAS
+                },
+            );
+            theme::rounded(dc, &item.rcItem, background, s(9));
+            theme::text(
+                dc,
+                item.rcItem,
+                &self.text(id),
+                self.theme.body.0,
+                if disabled { theme::MUTED } else { theme::TEXT },
+                DT_SINGLELINE | DT_CENTER | DT_VCENTER,
+            );
+            if item.itemState & ODS_FOCUS != 0 {
+                let mut rect = item.rcItem;
+                rect.left += s(4);
+                rect.top += s(4);
+                rect.right -= s(4);
+                rect.bottom -= s(4);
+                // SAFETY: provided owner-draw DC and local focus rectangle are valid for this callback.
+                unsafe {
+                    DrawFocusRect(dc, &rect);
+                }
+            }
+        }
+    }
+
+    fn dpi_changed(&mut self, dpi: u32) -> Result<()> {
+        let theme = Theme::new(dpi.max(96))?;
+        // SAFETY: replace control fonts before releasing the old resources; controls borrow these handles.
+        unsafe {
+            for &(id, handle) in &self.controls {
+                if id == TERMINAL {
+                    continue;
+                }
+                let font = if matches!(id, 200 | 208) {
+                    theme.title.0
+                } else if id == 206 {
+                    theme.heading.0
+                } else {
+                    theme.body.0
+                };
+                SendMessageW(handle, WM_SETFONT, font as usize, 1);
+            }
+            SendMessageW(
+                self.control(LIST),
+                LB_SETITEMHEIGHT,
+                0,
+                theme::scale(58, dpi) as isize,
+            );
+        }
+        self.theme = theme;
+        self.layout();
+        Ok(())
     }
 
     fn text(&self, id: usize) -> String {
@@ -425,6 +781,8 @@ impl State {
                 DISK,
                 MEMORY,
                 LOCK,
+                TAB_TERMINAL,
+                TAB_DETAILS,
             ] {
                 EnableWindow(self.control(id), i32::from(unlocked));
             }
@@ -434,8 +792,23 @@ impl State {
                 i32::from(!unlocked && self.envelope.is_none()),
             );
             EnableWindow(self.control(UNLOCK), i32::from(!unlocked));
+            EnableWindow(self.control(SHOW_MASTER), i32::from(!unlocked));
+            EnableWindow(
+                self.control(DISCONNECT),
+                i32::from(unlocked && !self.children.is_empty()),
+            );
         }
         self.refresh_authentication();
+        terminal_view::attach(
+            self.control(TERMINAL),
+            if unlocked {
+                self.children.first().map(SshSession::input)
+            } else {
+                None
+            },
+            false,
+        );
+        self.layout();
     }
 
     fn authentication(&self) -> Authentication {
@@ -497,6 +870,7 @@ impl State {
                 SendMessageW(self.control(LIST), LB_SETCURSEL, index, 0);
             }
         }
+        self.layout();
     }
 
     fn reset_form(&mut self) {
@@ -511,13 +885,18 @@ impl State {
             SendMessageW(self.control(AUTHENTICATION), CB_SETCURSEL, 0, 0);
         }
         self.refresh_authentication();
+        self.workspace_labels();
     }
 
     fn unlock(&mut self) -> Result<()> {
         if Instant::now() < self.retry_after {
             return Err("Please wait a few seconds before trying the passphrase again.".into());
         }
+        self.show_master(false);
         let password = self.password(PASSWORD)?;
+        if self.envelope.is_some() && password.0.is_empty() {
+            return Err("Enter the original vault master passphrase to unlock.".into());
+        }
         let result = if let Some(envelope) = &self.envelope {
             UnlockedVault::unlock(&password, envelope)
         } else {
@@ -528,8 +907,15 @@ impl State {
             let vault = UnlockedVault::create(&password)?;
             let sealed = vault.seal(&[])?;
             self.store.write(&sealed)?;
-            self.envelope = Some(sealed);
-            Ok((vault, vec![]))
+            // Verify the durable record with the same master passphrase before reporting setup success.
+            self.envelope = Some(
+                self.store
+                    .read()?
+                    .ok_or("The new vault record could not be read back.")?,
+            );
+            self.set(UNLOCK, "Unlock vault");
+            self.refresh_enabled();
+            UnlockedVault::unlock(&password, self.envelope.as_ref().unwrap())
         };
         match result {
             Ok((vault, hosts)) => {
@@ -541,7 +927,11 @@ impl State {
                 self.refresh_enabled();
                 self.refresh_list();
                 self.reset_form();
-                self.set(STATUS, "Vault unlocked. Add a server or select a saved server. Changes are encrypted and committed to the local database.");
+                self.layout();
+                self.set(
+                    STATUS,
+                    "Vault unlocked. Select a server to connect, or add a new server.",
+                );
                 Ok(())
             }
             Err(error) => {
@@ -554,6 +944,7 @@ impl State {
     }
 
     fn lock(&mut self) {
+        self.show_master(false);
         for child in &mut self.children {
             child.cancel_pending_credentials();
         }
@@ -573,13 +964,17 @@ impl State {
             }
         }
         self.hosts.clear();
+        self.active_label = "SSH session".into();
         self.refresh_list();
         self.reset_form();
         self.set(PORT, "");
         self.set(PASSWORD, "");
         self.set(CONFIRM, "");
         self.refresh_enabled();
-        self.set(STATUS, "Vault locked. Existing SSH consoles and identities in your Windows SSH agent remain available independently.");
+        self.set(
+            STATUS,
+            "Vault locked. Terminal hidden and input paused. Unlock to return to your session.",
+        );
     }
 
     fn select(&mut self) {
@@ -610,6 +1005,7 @@ impl State {
             );
         }
         self.refresh_authentication();
+        self.workspace_labels();
     }
 
     fn save(&mut self) -> Result<()> {
@@ -657,7 +1053,11 @@ impl State {
         self.selected = Some(selected);
         self.refresh_list();
         self.refresh_authentication();
-        self.set(STATUS, "Server saved. The database and transaction logs receive an encrypted inventory envelope.");
+        self.workspace_labels();
+        self.set(
+            STATUS,
+            "Server saved. Select Terminal and connect when ready.",
+        );
         Ok(())
     }
 
@@ -687,7 +1087,8 @@ impl State {
                 self.selected
                     .ok_or("Select and save a server before connecting.")?,
             )
-            .ok_or("Selected server no longer exists.")?;
+            .ok_or("Selected server no longer exists.")?
+            .clone();
         let password = if host.authentication == Authentication::Password {
             Some(
                 vault.decrypt_password(
@@ -699,13 +1100,54 @@ impl State {
         } else {
             None
         };
-        self.children
-            .push(super::ssh::connect(&self.paths, host, action, password)?);
-        self.set(STATUS, "OpenSSH launched in its own console. Verify any new host fingerprint using a trusted source. A changed fingerprint blocks the connection.");
+        self.disconnect();
+        self.details = false;
+        self.layout();
+        let terminal = self.control(TERMINAL);
+        terminal_view::attach(terminal, None, true);
+        let session = super::ssh::connect(
+            &self.paths,
+            &host,
+            action,
+            password,
+            terminal_view::size(terminal),
+        )?;
+        terminal_view::attach(terminal, Some(session.input()), false);
+        self.active_label = format!("{}@{}:{}", host.username, host.address, host.port);
+        self.children.push(session);
+        self.refresh_enabled();
+        // SAFETY: the visible terminal child can receive keyboard focus on this UI thread.
+        unsafe {
+            SetFocus(terminal);
+        }
+        self.set(STATUS, "Connecting in the built-in terminal. Verify any new host fingerprint using a trusted source.");
         Ok(())
     }
 
+    fn disconnect(&mut self) {
+        let terminal = self.control(TERMINAL);
+        terminal_view::attach(terminal, None, false);
+        for child in &mut self.children {
+            child.cancel_pending_credentials();
+            for bytes in child.finish_output() {
+                terminal_view::feed(terminal, &bytes);
+            }
+        }
+        self.children.clear();
+        self.active_label.clear();
+        self.refresh_enabled();
+        self.set(
+            STATUS,
+            "Session disconnected. Terminal output remains available until the next connection.",
+        );
+    }
+
     fn confirmation(&self, id: usize) -> Result<Option<String>> {
+        if id == CONNECT && !self.children.is_empty() {
+            return Ok(Some(
+                "Disconnect the current SSH session and connect to the selected server?".into(),
+            ));
+        }
         if id == DELETE || matches!(id, SYSTEM | UPTIME | DISK | MEMORY) {
             let host = self
                 .hosts
@@ -724,11 +1166,16 @@ impl State {
                 _ => ReadOnlyAction::Memory,
             };
             return Ok(Some(format!(
-                "Run this read-only check on {}@{}:{}?\n\n{}\n\nOutput appears in a Windows SSH console.",
+                "Run this read-only check on {}@{}:{}?\n\n{}\n\nOutput appears in the built-in terminal.{}",
                 host.username,
                 host.address,
                 host.port,
-                action.command()
+                action.command(),
+                if self.children.is_empty() {
+                    ""
+                } else {
+                    " The current SSH session will disconnect."
+                }
             )));
         }
         Ok(None)
@@ -748,6 +1195,13 @@ impl State {
             return Ok(());
         }
         match id {
+            SHOW_MASTER => {
+                // SAFETY: queries the live checkbox's checked state.
+                let show = unsafe { SendMessageW(self.control(SHOW_MASTER), BM_GETCHECK, 0, 0) }
+                    == BST_CHECKED as isize;
+                self.show_master(show);
+                Ok(())
+            }
             UNLOCK => self.unlock(),
             LOCK => {
                 self.lock();
@@ -755,6 +1209,21 @@ impl State {
             }
             NEW if self.vault.is_some() => {
                 self.reset_form();
+                self.details = true;
+                self.layout();
+                // SAFETY: visible edit is owned by this window.
+                unsafe {
+                    SetFocus(self.control(NAME));
+                }
+                Ok(())
+            }
+            TAB_TERMINAL | TAB_DETAILS if self.vault.is_some() => {
+                self.details = id == TAB_DETAILS;
+                self.layout();
+                Ok(())
+            }
+            DISCONNECT if self.vault.is_some() => {
+                self.disconnect();
                 Ok(())
             }
             SAVE => self.save(),
@@ -768,23 +1237,53 @@ impl State {
         }
     }
 
+    fn show_master(&self, show: bool) {
+        // SAFETY: edits and checkbox belong to the live window; repaint shows the new masking state.
+        unsafe {
+            SendMessageW(
+                self.control(SHOW_MASTER),
+                BM_SETCHECK,
+                if show { BST_CHECKED } else { BST_UNCHECKED } as usize,
+                0,
+            );
+            for id in [PASSWORD, CONFIRM] {
+                SendMessageW(
+                    self.control(id),
+                    EM_SETPASSWORDCHAR,
+                    if show { 0 } else { b'*' as usize },
+                    0,
+                );
+                InvalidateRect(self.control(id), null(), 1);
+            }
+        }
+    }
+
     fn tick(&mut self) {
         if self.vault.is_some() && self.last_activity.elapsed() >= Duration::from_secs(600) {
             self.lock();
         }
-        let mut failed_exit = None;
+        let terminal = self.control(TERMINAL);
+        let mut exit = None;
         self.children.retain_mut(|child| {
+            let protocol_input = child.input();
+            for bytes in child.output() {
+                terminal_view::feed_session(terminal, &bytes, &protocol_input);
+            }
             if let Ok(Some(status)) = child.try_wait() {
-                if status != 0 {
-                    failed_exit = Some(status);
+                for bytes in child.finish_output() {
+                    terminal_view::feed(terminal, &bytes);
                 }
+                exit = Some(status);
                 false
             } else {
                 true
             }
         });
-        if let Some(code) = failed_exit {
-            self.set(STATUS, &format!("OpenSSH exited with code {code}. Check the host address, trust decision, and login credentials; retry from the server list."));
+        if let Some(code) = exit {
+            terminal_view::attach(terminal, None, false);
+            self.active_label.clear();
+            self.refresh_enabled();
+            self.set(STATUS, &if code == 0 { "Session finished. Its output remains in the terminal.".into() } else { format!("OpenSSH exited with code {code}. Check the terminal output and your server's address and login details.") });
         }
     }
 }
@@ -835,6 +1334,107 @@ unsafe extern "system" fn window_proc(
         } else {
             // SAFETY: the box remains owned by the live window until WM_NCDESTROY.
             let cell = unsafe { &*pointer };
+            if message == WM_CLOSE {
+                let active = match cell.try_borrow_mut() {
+                    Ok(state) => !state.children.is_empty(),
+                    Err(_) => {
+                        // SAFETY: defer teardown until the current state operation has released its borrow.
+                        unsafe {
+                            PostMessageW(window, WM_CLOSE, 0, 0);
+                        }
+                        return 0;
+                    }
+                };
+                if active
+                    && !confirm(
+                        window,
+                        "Close SentinelSSH and disconnect the active SSH session?",
+                    )
+                {
+                    return 0;
+                }
+                // SAFETY: modal close may dispatch nested destruction; only destroy if ownership is unchanged.
+                unsafe {
+                    if GetWindowLongPtrW(window, GWLP_USERDATA) == pointer as isize {
+                        DestroyWindow(window);
+                    }
+                }
+                return 0;
+            }
+            if matches!(
+                message,
+                WM_PAINT
+                    | WM_PRINTCLIENT
+                    | WM_DRAWITEM
+                    | WM_CTLCOLORSTATIC
+                    | WM_CTLCOLOREDIT
+                    | WM_CTLCOLORLISTBOX
+                    | WM_CTLCOLORBTN
+            ) && let Ok(state) = cell.try_borrow()
+            {
+                match message {
+                    WM_PAINT => {
+                        state.paint();
+                        return 0;
+                    }
+                    WM_PRINTCLIENT => {
+                        state.render(wparam as HDC);
+                        return 0;
+                    }
+                    WM_DRAWITEM if lparam != 0 => {
+                        // SAFETY: Windows supplies a valid DRAWITEMSTRUCT for this synchronous owner-draw message.
+                        state.draw_item(unsafe { &*(lparam as *const DRAWITEMSTRUCT) });
+                        return 1;
+                    }
+                    WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
+                        // SAFETY: colour messages supply live DC/control handles, borrowed for this callback only.
+                        unsafe {
+                            let dc = wparam as HDC;
+                            let id = GetDlgCtrlID(lparam as HWND) as usize;
+                            let input = message == WM_CTLCOLOREDIT
+                                || matches!(
+                                    id,
+                                    PASSWORD
+                                        | CONFIRM
+                                        | NAME
+                                        | ADDRESS
+                                        | PORT
+                                        | USERNAME
+                                        | IDENTITY
+                                        | SERVER_PASSWORD
+                                        | AUTHENTICATION
+                                );
+                            let panel = matches!(id, LIST | LIST_HINT | 205 | 220);
+                            let colour = if input {
+                                theme::INPUT
+                            } else if panel {
+                                theme::PANEL
+                            } else {
+                                theme::CANVAS
+                            };
+                            SetBkColor(dc, theme::color(colour));
+                            SetTextColor(
+                                dc,
+                                theme::color(if matches!(id, 200 | 206 | 208) || input {
+                                    theme::TEXT
+                                } else if id == VAULT_BADGE && state.vault.is_some() {
+                                    theme::GREEN
+                                } else {
+                                    theme::MUTED
+                                }),
+                            );
+                            return if input {
+                                state.theme.input.0
+                            } else if panel {
+                                state.theme.panel.0
+                            } else {
+                                state.theme.canvas.0
+                            } as isize;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // Release the state borrow before modal dialogs so workstation lock/suspend
             // messages can still lock the vault while a confirmation is visible.
             if message == WM_COMMAND && (wparam >> 16) & 0xffff == BN_CLICKED as usize {
@@ -866,6 +1466,53 @@ unsafe extern "system" fn window_proc(
             // Native controls send synchronous notifications. RefCell prevents mutable aliasing on reentry.
             if let Ok(mut state) = cell.try_borrow_mut() {
                 match message {
+                    WM_ERASEBKGND => return 1,
+                    WM_SIZE => {
+                        state.layout();
+                        return 0;
+                    }
+                    WM_GETMINMAXINFO if lparam != 0 => {
+                        // SAFETY: Windows supplies writable MINMAXINFO for this callback.
+                        unsafe {
+                            let info = &mut *(lparam as *mut MINMAXINFO);
+                            info.ptMinTrackSize.x = theme::scale(960, state.theme.dpi);
+                            info.ptMinTrackSize.y = theme::scale(660, state.theme.dpi);
+                        }
+                        return 0;
+                    }
+                    WM_DPICHANGED if lparam != 0 => {
+                        if let Err(error) = state.dpi_changed((wparam & 0xffff) as u32) {
+                            state.set(STATUS, &error);
+                        }
+                        // SAFETY: suggested bounds are supplied by Windows; changing the parent resizes its children.
+                        unsafe {
+                            let rect = &*(lparam as *const RECT);
+                            SetWindowPos(
+                                window,
+                                null_mut(),
+                                rect.left,
+                                rect.top,
+                                rect.right - rect.left,
+                                rect.bottom - rect.top,
+                                SWP_NOACTIVATE | SWP_NOZORDER,
+                            );
+                        }
+                        state.layout();
+                        return 0;
+                    }
+                    terminal_view::RESIZED => {
+                        if let Some(child) = state.children.first() {
+                            let (columns, rows) = terminal_view::size(state.control(TERMINAL));
+                            if let Err(error) = child.resize(columns, rows) {
+                                state.set(STATUS, &error);
+                            }
+                        }
+                        return 0;
+                    }
+                    terminal_view::ACTIVITY => {
+                        state.last_activity = Instant::now();
+                        return 0;
+                    }
                     WM_COMMAND => {
                         let result = state.command(wparam & 0xffff, (wparam >> 16) & 0xffff);
                         if let Err(error) = result {
@@ -911,16 +1558,18 @@ unsafe extern "system" fn window_proc(
 fn create_window(paths: AppPaths) -> Result<HWND> {
     let state = State::new(paths)?;
     let class = wide("SentinelSSH.NativeWindow.v1");
-    let title = wide("SentinelSSH — Rust native preview");
+    let title = wide("SentinelSSH");
     // SAFETY: all Windows pointers refer to live buffers; null module name selects the current executable.
     let window = unsafe {
         let instance = GetModuleHandleW(null());
+        let initial_dpi = GetDpiForSystem().max(96);
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let screen_height = GetSystemMetrics(SM_CYSCREEN);
         let definition = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance,
             lpszClassName: class.as_ptr(),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: (COLOR_WINDOW + 1) as *mut _,
             ..Default::default()
         };
         // A prior test/window may have registered the same class; CreateWindow validates it below.
@@ -929,11 +1578,15 @@ fn create_window(paths: AppPaths) -> Result<HWND> {
             0,
             class.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            916,
-            840,
+            theme::scale(1260, initial_dpi)
+                .min(screen_width - 40)
+                .max(theme::scale(960, initial_dpi).min(screen_width)),
+            theme::scale(850, initial_dpi)
+                .min(screen_height - 60)
+                .max(theme::scale(660, initial_dpi).min(screen_height - 40)),
             null_mut(),
             null_mut(),
             instance,
@@ -945,6 +1598,16 @@ fn create_window(paths: AppPaths) -> Result<HWND> {
             "Cannot create desktop window: {}",
             std::io::Error::last_os_error()
         ));
+    }
+    let dark_caption = 1i32;
+    // SAFETY: Windows copies this BOOL value synchronously; unsupported caption styling is harmless.
+    unsafe {
+        DwmSetWindowAttribute(
+            window,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            std::ptr::addr_of!(dark_caption).cast(),
+            std::mem::size_of_val(&dark_caption) as u32,
+        );
     }
     let pointer = Box::into_raw(Box::new(RefCell::new(state)));
     // SAFETY: attaches ownership to the live window, which releases it only in WM_NCDESTROY.
@@ -964,6 +1627,10 @@ fn create_window(paths: AppPaths) -> Result<HWND> {
 }
 
 pub fn run() -> Result<()> {
+    // SAFETY: choose per-monitor DPI scaling before any application windows exist.
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     let window = create_window(AppPaths::discover()?)?;
     // SAFETY: shows a live window; the message struct is initialized and reused by GetMessage.
     unsafe {
@@ -978,7 +1645,12 @@ pub fn run() -> Result<()> {
                 DestroyWindow(window);
                 return Err("Windows message loop failed.".into());
             }
-            if IsDialogMessageW(window, &message) == 0 {
+            let pointer = GetWindowLongPtrW(window, GWLP_USERDATA) as *const RefCell<State>;
+            let terminal_focused = !pointer.is_null()
+                && (*pointer)
+                    .try_borrow()
+                    .is_ok_and(|state| GetFocus() == state.control(TERMINAL));
+            if terminal_focused || IsDialogMessageW(window, &message) == 0 {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -991,8 +1663,87 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn preview(window: HWND, name: &str) {
+        let Some(directory) = std::env::var_os("SENTINEL_UI_PREVIEW_DIR") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        // SAFETY: screenshot renders only this test's disposable window, never other windows or the desktop.
+        unsafe {
+            ShowWindow(window, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                window,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            RedrawWindow(
+                window,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+            let mut bounds = RECT::default();
+            GetClientRect(window, &mut bounds);
+            let source = GetDC(window);
+            let dc = CreateCompatibleDC(source);
+            let bitmap = CreateCompatibleBitmap(source, bounds.right, bounds.bottom);
+            assert!(!dc.is_null() && !bitmap.is_null());
+            let old = SelectObject(dc, bitmap);
+            BitBlt(dc, 0, 0, bounds.right, bounds.bottom, source, 0, 0, SRCCOPY);
+            SelectObject(dc, old);
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: bounds.right,
+                    biHeight: -bounds.bottom,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels = vec![0u8; bounds.right as usize * bounds.bottom as usize * 4];
+            assert_ne!(
+                GetDIBits(
+                    dc,
+                    bitmap,
+                    0,
+                    bounds.bottom as u32,
+                    pixels.as_mut_ptr().cast(),
+                    &mut info,
+                    DIB_RGB_COLORS
+                ),
+                0
+            );
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            ReleaseDC(window, source);
+            ShowWindow(window, SW_HIDE);
+            let mut bytes = Vec::with_capacity(pixels.len() + 54);
+            bytes.extend_from_slice(b"BM");
+            bytes.extend_from_slice(&((pixels.len() + 54) as u32).to_le_bytes());
+            bytes.extend_from_slice(&[0; 4]);
+            bytes.extend_from_slice(&54u32.to_le_bytes());
+            bytes.extend_from_slice(&40u32.to_le_bytes());
+            bytes.extend_from_slice(&bounds.right.to_le_bytes());
+            bytes.extend_from_slice(&(-bounds.bottom).to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&32u16.to_le_bytes());
+            bytes.extend_from_slice(&[0; 24]);
+            bytes.extend_from_slice(&pixels);
+            std::fs::write(directory.join(format!("{name}.bmp")), bytes).unwrap();
+        }
+    }
+
     #[test]
     fn native_controls_save_lock_and_reopen_encrypted_inventory() {
+        const MASTER: &str = "  test passphrase ঢাকা e\u{301} with spaces  ";
         let root = std::env::temp_dir().join(format!(
             "sentinel-ui-test-{}-{}",
             std::process::id(),
@@ -1009,14 +1760,30 @@ mod tests {
             ssh: root.join("no-ssh.exe"),
         };
         let window = create_window(make_paths()).unwrap();
+        preview(window, "vault-setup");
         // SAFETY: test owns the window and its attached state throughout each scoped borrow.
         unsafe {
             let cell = &*(GetWindowLongPtrW(window, GWLP_USERDATA) as *const RefCell<State>);
             {
                 let mut state = cell.borrow_mut();
-                state.set(PASSWORD, "test passphrase with many words");
-                state.set(CONFIRM, "test passphrase with many words");
+                state.set(PASSWORD, MASTER);
+                state.set(CONFIRM, MASTER);
+                state.show_master(true);
+                assert_eq!(
+                    SendMessageW(state.control(PASSWORD), EM_GETPASSWORDCHAR, 0, 0),
+                    0
+                );
+                assert_eq!(state.password(CONFIRM).unwrap().0, MASTER.as_bytes());
+                state.set(CONFIRM, MASTER);
                 state.unlock().unwrap();
+                assert_ne!(
+                    SendMessageW(state.control(PASSWORD), EM_GETPASSWORDCHAR, 0, 0),
+                    0
+                );
+                assert_eq!(
+                    SendMessageW(state.control(SHOW_MASTER), BM_GETCHECK, 0, 0),
+                    BST_UNCHECKED as isize
+                );
                 assert!(state.text(PASSWORD).is_empty());
                 assert!(state.text(CONFIRM).is_empty());
                 state.set(NAME, "confidential-test-name");
@@ -1025,6 +1792,19 @@ mod tests {
                 state.save().unwrap();
                 assert_eq!(state.hosts.len(), 1);
                 assert_eq!(state.hosts[0].authentication, Authentication::Key);
+                state.details = true;
+                state.layout();
+            }
+            preview(window, "server-details");
+            {
+                let mut state = cell.borrow_mut();
+                state.details = false;
+                state.layout();
+                terminal_view::feed(state.control(TERMINAL), b"\x1b[38;2;126;231;135mdeploy@demo:~$\x1b[0m uname -a\r\nLinux demo 6.8.0 x86_64 GNU/Linux\r\n\r\n\x1b[38;2;126;231;135mdeploy@demo:~$\x1b[0m df -h /\r\nFilesystem      Size  Used Avail Use% Mounted on\r\n/dev/vda1        80G   12G   68G  15% /\r\n\r\n\x1b[38;2;126;231;135mdeploy@demo:~$\x1b[0m ");
+            }
+            preview(window, "terminal-workspace");
+            {
+                let mut state = cell.borrow_mut();
                 SendMessageW(state.control(AUTHENTICATION), CB_SETCURSEL, 1, 0);
                 state
                     .command(AUTHENTICATION, CBN_SELCHANGE as usize)
@@ -1065,17 +1845,23 @@ mod tests {
                 assert!(state.vault.is_none());
                 assert!(state.text(SERVER_PASSWORD).is_empty());
                 assert_eq!(SendMessageW(state.control(LIST), LB_GETCOUNT, 0, 0), 0);
+                assert_eq!(
+                    windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(
+                        state.control(TERMINAL)
+                    ),
+                    0
+                );
             }
             {
                 let mut state = cell.borrow_mut();
-                state.set(PASSWORD, "test passphrase with many words");
+                state.set(PASSWORD, MASTER);
                 state.unlock().unwrap();
             }
             SendMessageW(window, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK as usize, 0);
             assert!(cell.borrow().vault.is_none());
             {
                 let mut state = cell.borrow_mut();
-                state.set(PASSWORD, "test passphrase with many words");
+                state.set(PASSWORD, MASTER);
                 state.unlock().unwrap();
             }
             SendMessageW(window, WM_POWERBROADCAST, PBT_APMSUSPEND as usize, 0);
@@ -1086,7 +1872,7 @@ mod tests {
                 &*(GetWindowLongPtrW(reopened, GWLP_USERDATA) as *const RefCell<State>);
             {
                 let mut state = reopened_cell.borrow_mut();
-                state.set(PASSWORD, "test passphrase with many words");
+                state.set(PASSWORD, MASTER);
                 state.unlock().unwrap();
                 assert_eq!(state.hosts[0].name, "confidential-test-name");
                 assert_eq!(state.hosts[0].authentication, Authentication::Password);

@@ -1,4 +1,5 @@
 pub mod core;
+pub mod terminal;
 
 #[cfg(windows)]
 pub mod windows;

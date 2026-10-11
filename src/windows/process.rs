@@ -1,19 +1,32 @@
 use crate::Result;
-use std::{ffi::OsString, os::windows::ffi::OsStrExt, path::Path, ptr::null};
+use std::{ffi::OsString, os::windows::ffi::OsStrExt, path::Path};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
-    System::Threading::{
-        CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess,
-        PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
-    },
+    System::Threading::{GetExitCodeProcess, PROCESS_INFORMATION, WaitForSingleObject},
 };
 
-pub struct ConsoleProcess {
+pub struct ChildProcess {
     handle: HANDLE,
     id: u32,
 }
 
-impl ConsoleProcess {
+impl ChildProcess {
+    pub(crate) fn take(information: PROCESS_INFORMATION) -> Self {
+        // SAFETY: successful CreateProcessW returned owned process/thread handles.
+        unsafe {
+            CloseHandle(information.hThread);
+        }
+        Self {
+            handle: information.hProcess,
+            id: information.dwProcessId,
+        }
+    }
+    pub fn terminate(&self) {
+        // SAFETY: wrapper owns the process; termination is used only for an explicit session teardown.
+        unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(self.handle, 1);
+        }
+    }
     pub fn id(&self) -> u32 {
         self.id
     }
@@ -35,7 +48,7 @@ impl ConsoleProcess {
     }
 }
 
-impl Drop for ConsoleProcess {
+impl Drop for ChildProcess {
     fn drop(&mut self) {
         // SAFETY: this wrapper owns the real process handle; closing it does not end the SSH session.
         unsafe {
@@ -70,7 +83,7 @@ fn quote_argument(units: impl IntoIterator<Item = u16>) -> Result<Vec<u16>> {
     Ok(quoted)
 }
 
-fn command_line(executable: &Path, arguments: &[String]) -> Result<Vec<u16>> {
+pub(crate) fn command_line(executable: &Path, arguments: &[String]) -> Result<Vec<u16>> {
     let mut line = quote_argument(executable.as_os_str().encode_wide())?;
     for argument in arguments {
         line.push(b' ' as u16);
@@ -83,7 +96,7 @@ fn command_line(executable: &Path, arguments: &[String]) -> Result<Vec<u16>> {
     Ok(line)
 }
 
-fn environment(overrides: &[(OsString, OsString)]) -> Result<Vec<u16>> {
+pub(crate) fn environment(overrides: &[(OsString, OsString)]) -> Result<Vec<u16>> {
     let mut values: Vec<_> = std::env::vars_os()
         .filter(|(key, _)| {
             !overrides.iter().any(|(name, _)| {
@@ -115,56 +128,6 @@ fn environment(overrides: &[(OsString, OsString)]) -> Result<Vec<u16>> {
     }
     block.push(0);
     Ok(block)
-}
-
-pub fn spawn_console(
-    executable: &Path,
-    arguments: &[String],
-    directory: &Path,
-    overrides: &[(OsString, OsString)],
-) -> Result<ConsoleProcess> {
-    if !executable.is_absolute() {
-        return Err("The SSH executable must have an absolute system path.".into());
-    }
-    let executable_wide = super::paths::path_wide(executable);
-    let directory_wide = super::paths::path_wide(directory);
-    let mut command = command_line(executable, arguments)?;
-    let environment = environment(overrides)?;
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    let mut information = PROCESS_INFORMATION::default();
-    // SAFETY: buffers and structures remain alive. No handles are inherited and
-    // STARTF_USESTDHANDLES is absent, so the new console receives its own stdin/output.
-    if unsafe {
-        CreateProcessW(
-            executable_wide.as_ptr(),
-            command.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr().cast(),
-            directory_wide.as_ptr(),
-            &startup,
-            &mut information,
-        )
-    } == 0
-    {
-        return Err(format!(
-            "Cannot launch Windows OpenSSH: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: CreateProcessW returned an owned thread handle; only the process handle is retained.
-    unsafe {
-        CloseHandle(information.hThread);
-    }
-    Ok(ConsoleProcess {
-        handle: information.hProcess,
-        id: information.dwProcessId,
-    })
 }
 
 #[cfg(test)]
