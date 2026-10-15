@@ -197,7 +197,7 @@ impl View {
                         right: bounds.right - pad,
                         bottom: middle + theme::scale(84, self.dpi),
                     },
-                    "Use Connect on a server card to open a session tab.",
+                    "Open Servers to connect or add your first server.",
                     self.body.0,
                     theme::MUTED,
                     DT_CENTER | DT_SINGLELINE | DT_VCENTER,

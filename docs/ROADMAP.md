@@ -17,6 +17,7 @@ Updated: 13 October 2026. The full scope remains in [the engineering plan](../se
 - [x] Wrong-password, tamper, invalid-input, native UI, encrypted-artifact, and crash-recovery tests.
 - [x] Dark resizable workspace, server-card Connect/Edit controls, and a separate server editor.
 - [x] Slint Windows frontend with hover/press/focus animations, native terminal hosting, dark scrollbars, and disposable UI preview/smoke tests.
+- [x] Compact session toolbar, application menu, animated server drawer, and terminal bounds that follow drawer resizing at Windows DPI.
 - [x] Independent SSH session tabs, per-session terminal/history, tab paging/closing, and active-tab shortcut routing.
 - [x] ConPTY terminal with common VT rendering, keyboard, colours, copy/paste, resize, bounded history, and explicit disconnect.
 - [x] Console-attachment/input/resize/final-output/cleanup tests and hostile-output parser tests.

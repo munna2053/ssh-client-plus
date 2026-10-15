@@ -13,14 +13,15 @@ export component ActionButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
     in property <bool> enabled: true;
+    in property <bool> flat: false;
     callback clicked;
     public function take-focus() { focus.focus(); }
     height: 36px;
     min-width: 36px;
     border-radius: 9px;
-    background: !root.enabled ? Colors.surface : touch.pressed ? (root.primary ? #7861d8 : #26344d) : touch.has-hover ? (root.primary ? #b19eff : #25334b) : root.primary ? Colors.accent : Colors.surface;
+    background: !root.enabled ? (root.flat ? transparent : Colors.surface) : touch.pressed ? (root.primary ? #7861d8 : #26344d) : touch.has-hover ? (root.primary ? #b19eff : #25334b) : root.primary ? Colors.accent : root.flat ? transparent : Colors.surface;
     border-width: 1px;
-    border-color: focus.has-focus ? Colors.accent : touch.has-hover ? #53607c : root.primary ? transparent : Colors.border;
+    border-color: focus.has-focus ? Colors.accent : root.flat ? transparent : touch.has-hover ? #53607c : root.primary ? transparent : Colors.border;
     opacity: root.enabled ? 1 : 0.45;
     animate background, border-color, opacity { duration: 150ms; easing: ease-out; }
     forward-focus: focus;
@@ -53,6 +54,13 @@ export component ActionButton inherits Rectangle {
             return reject;
         }
     }
+}
+
+export component MenuAction inherits ActionButton {
+    in property <string> label;
+    flat: true;
+    accessible-label: root.label;
+    Text { x: 12px; width: parent.width - 24px; height: parent.height; text: root.label; color: Colors.text; vertical-alignment: center; font-size: 13px; }
 }
 
 export component Field inherits Rectangle {

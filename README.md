@@ -4,7 +4,7 @@ A Windows-native SSH manager written in Rust. This is an internal preview of the
 
 ## Current features
 
-- Resizable Slint workspace with animated buttons, keyboard-focus feedback, Connect/Edit buttons on each server card, a server editor, and separate session tabs.
+- Compact Slint workspace with session tabs, an animated server drawer, a Notepad-style application menu, animated buttons, and keyboard-focus feedback.
 - Master-passphrase setup and unlock, a ten-minute application idle lock, and workstation-lock/suspend handling.
 - Add, edit, and delete saved servers: display name, hostname/IP, SSH port, Linux username, and optional identity-file path.
 - Choose key/agent authentication or a saved server password encrypted with the master vault's data key.
@@ -50,11 +50,13 @@ The portable script needs a project-local `1.90.0-x86_64-pc-windows-gnu` toolcha
 
 1. Enable **OpenSSH Client** in Windows Settings → Optional features if the app reports it missing.
 2. Create a long master passphrase and confirm it. There is no password-reset or portable recovery workflow in this preview.
-3. Choose **New server** in the sidebar, then add a Linux server. Choose **SSH key / agent** and an existing passphrase-protected identity file (blank uses your Windows SSH agent), or **Saved password** and enter the server password. Choose **Save server**.
+3. Open **Servers → New server**, or choose **⋯ → New server**, then add a Linux server. Choose **SSH key / agent** and an existing passphrase-protected identity file (blank uses your Windows SSH agent), or **Saved password** and enter the server password. Choose **Save server**.
 4. Choose **Connect** on a server card to open a new session tab. Confirm the server's fingerprint against a trusted source before accepting a new host key. Key login prompts in the terminal; saved-password login shows a native fingerprint confirmation dialog.
 5. Choose **Edit** on a server card to edit or delete that server; **Done** returns to the sessions. With a session active, use **Shortcuts** beside the session tabs to insert a command. Edit it as needed, then press Enter in the terminal to run it.
 
 Up to 16 session tabs can stay open, each with its own terminal and bounded history. Connecting opens a new tab and keeps existing sessions running. Switch tabs to select the terminal; arrows reveal tabs when the row fills. Command shortcuts insert text into the selected session, including when a different saved server is selected for editing. The **×** button closes that tab and asks before disconnecting a running session; closing the app asks before ending all running sessions. Remote jobs may respond to SSH disconnection according to their own shell/job settings. Completed output stays in its tab until you close it.
+
+The terminal uses nearly the full window below a single compact row of tabs. **Servers** opens or closes the left drawer with server-card **Connect** and **Edit** buttons and **+ New server**. The drawer starts closed and closes when you open a session or server editor. The **⋯** menu contains the app logo, vault status, **New server**, server-drawer controls, **Lock vault**, **About**, and keyboard help. Escape or a click outside dismisses the menu and restores the terminal. **Shortcuts** stays beside the session tabs.
 
 The session-close confirmation includes an initially unchecked **Do not show this again** option. Check it and choose **Yes** to skip future tab-close prompts, including after restarting the app. Choosing **No** keeps the tab open and does not save the checkbox. To restore tab-close prompts, close the app and remove `%LOCALAPPDATA%\SentinelSSH\skip-session-close-confirmation`.
 
@@ -94,6 +96,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Actio
 ```
 
 Tests cover bounded record decoding and legacy key-inventory migration, target/argument injection, Windows quoting, AES-GCM tampering, wrong-password rejection, encrypted-password replacement/preservation, native-control save/lock/reopen behavior, idle/lock/suspend messages, plaintext absence in ESE artifacts, and recovery after forced process termination. Executable-helper tests cover Unicode/space preservation, the maximum password length, single-use delivery, cancellation, wrong parent/owner rejection, and unsupported prompts. ConPTY subprocess tests verify a real console attachment, input, resize, final output, failed-launch cleanup, and shutdown under heavy output. Renderer tests cover fragmented UTF-8/VT, alternate screens, colours, cursor movement, bounded history, and hostile control strings. Tests create isolated temporary directories with disposable fixture data. Native/ESE tests run serially.
+
+On a Windows desktop, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check-window-restore.ps1` after the release build to check the presented compact row and terminal across six minimize/restore cycles, including maximized windows. This uses disposable preview data and never opens the real vault or SSH connections. Pass `-Executable <path>` to check a different build.
 
 The local Windows OpenSSH 9.5p2 configuration was checked with `ssh -G`, including the managed trust path with spaces and both authentication modes. A loopback connection-failure test also verifies the actual system OpenSSH output reaches the embedded terminal. A live Linux password/key login, key-passphrase prompt, host-key mismatch, and remote command execution still need integration testing with disposable Linux hosts. See [the threat model and remaining release gates](docs/THREAT_MODEL.md).
 

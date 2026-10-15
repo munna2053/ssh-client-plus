@@ -15,7 +15,7 @@ use crate::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::{Rc, Weak},
     time::{Duration, Instant},
 };
@@ -184,6 +184,8 @@ impl Controller {
         };
         // SAFETY: queries the live Slint parent; child coordinates use the same physical DPI.
         let scale = unsafe { GetDpiForWindow(self.window) }.max(96) as f32 / 96.0;
+        // SAFETY: the parent is live. Keep terminal grids intact through minimized/zero-size layouts.
+        let minimized = unsafe { IsIconic(self.window) } != 0;
         let bounds = [
             (ui.get_terminal_x() * scale).round() as i32,
             (ui.get_terminal_y() * scale).round() as i32,
@@ -196,7 +198,7 @@ impl Controller {
             let shown = visible && self.active == Some(index);
             // SAFETY: each terminal belongs to this controller and parent; layout is performed on the UI thread.
             unsafe {
-                if tab.bounds != Some(bounds) {
+                if !minimized && tab.bounds != Some(bounds) {
                     MoveWindow(tab.terminal, bounds[0], bounds[1], bounds[2], bounds[3], 1);
                     tab.bounds = Some(bounds);
                 }
@@ -222,7 +224,7 @@ impl Controller {
         }
         // SAFETY: this empty-state terminal is owned by the same live parent.
         unsafe {
-            if self.empty_bounds != Some(bounds) {
+            if !minimized && self.empty_bounds != Some(bounds) {
                 MoveWindow(
                     self.empty_terminal,
                     bounds[0],
@@ -314,6 +316,7 @@ impl Controller {
     }
 
     fn lock(&mut self) {
+        self.dismiss_popups();
         self.dismiss_close_confirmation();
         for tab in &mut self.tabs {
             if let Some(session) = &mut tab.session {
@@ -345,6 +348,8 @@ impl Controller {
             ui.set_confirmation("".into());
             ui.set_show_master(false);
             ui.set_editor_open(false);
+            ui.set_drawer_open(false);
+            ui.set_about_open(false);
             ui.set_shortcuts_open(false);
             ui.set_terminal_image(slint::Image::default());
         }
@@ -358,7 +363,10 @@ impl Controller {
             return Err("Unlock the vault first.".into());
         }
         self.reset_editor();
+        self.dismiss_popups();
         let ui = self.ui.upgrade().ok_or("Workspace closed.")?;
+        ui.set_drawer_open(false);
+        ui.set_about_open(false);
         if let Some(index) = index {
             let host = self.hosts.get(index).ok_or("Server no longer exists.")?;
             self.selected = Some(index);
@@ -547,8 +555,11 @@ impl Controller {
         });
         let index = self.tabs.len() - 1;
         self.active = Some(index);
+        self.dismiss_popups();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_editor_open(false);
+            ui.set_drawer_open(false);
+            ui.set_about_open(false);
         }
         self.sync();
         self.position_terminals();
@@ -605,8 +616,11 @@ impl Controller {
             .ok_or("Session no longer exists.")?
             .terminal;
         self.active = Some(index);
+        self.dismiss_popups();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_editor_open(false);
+            ui.set_drawer_open(false);
+            ui.set_about_open(false);
         }
         self.sync();
         self.position_terminals();
@@ -636,8 +650,7 @@ impl Controller {
         let tab = self.tabs.get(index).ok_or("Session no longer exists.")?;
         ui.set_closing_session_name(tab.name.as_str().into());
         ui.set_skip_close_confirmation(false);
-        ui.set_shortcuts_open(false);
-        ui.set_terminal_image(slint::Image::default());
+        self.dismiss_popups();
         self.pending_close = Some(index);
         ui.set_close_confirmation_open(true);
         self.position_terminals();
@@ -720,6 +733,50 @@ impl Controller {
         Ok(())
     }
 
+    fn dismiss_popups(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.invoke_hide_app_menu();
+            ui.set_shortcuts_open(false);
+            ui.set_terminal_image(slint::Image::default());
+        }
+    }
+
+    fn open_app_menu(&mut self) -> Result<()> {
+        let ui = self.ui.upgrade().ok_or("Workspace closed.")?;
+        if ui.get_app_menu_open() || ui.get_close_confirmation_open() {
+            return Ok(());
+        }
+        self.dismiss_popups();
+        if self.vault.is_some() && !ui.get_editor_open() && !ui.get_about_open() {
+            let terminal = self
+                .active
+                .and_then(|index| self.tabs.get(index))
+                .map_or(self.empty_terminal, |tab| tab.terminal);
+            ui.set_terminal_image(slint::Image::from_rgba8(terminal_pixels(terminal)?));
+        }
+        ui.set_app_menu_open(true);
+        self.position_terminals();
+        ui.invoke_show_app_menu();
+        Ok(())
+    }
+
+    fn close_app_menu(&mut self) {
+        self.dismiss_popups();
+        self.position_terminals();
+        self.focus_terminal();
+    }
+
+    fn focus_terminal(&self) {
+        if let Some(tab) = self.active.and_then(|index| self.tabs.get(index))
+            && tab.shown
+        {
+            // SAFETY: the selected terminal is a visible native child owned by this controller.
+            unsafe {
+                SetFocus(tab.terminal);
+            }
+        }
+    }
+
     fn shortcut(&mut self, index: usize) -> Result<()> {
         if self.vault.is_none() {
             return Err("Unlock the vault first.".into());
@@ -784,7 +841,9 @@ impl Controller {
                 && !ui.get_active_running()
             {
                 ui.set_shortcuts_open(false);
-                ui.set_terminal_image(slint::Image::default());
+                if !ui.get_app_menu_open() {
+                    ui.set_terminal_image(slint::Image::default());
+                }
             }
         }
         if let Some(code) = exit {
@@ -828,6 +887,37 @@ fn confirm(window: HWND, message: &str) -> bool {
     }
 }
 
+struct NativeEvents {
+    controller: Weak<RefCell<Controller>>,
+    ui: slint::Weak<Workspace>,
+}
+
+fn mark_windows_damage(ui: &Workspace, window: HWND) {
+    let mut damage = RECT::default();
+    // SAFETY: inspect the live parent's update region before Winit/softbuffer validates it.
+    // Internal Slint redraws have no update rectangle, so normal partial rendering stays enabled.
+    if unsafe { IsIconic(window) != 0 || GetUpdateRect(window, &mut damage, 0) == 0 } {
+        return;
+    }
+    // Slint 1.13.1 does not propagate Windows damage to its software renderer. Keep
+    // this compatibility shim isolated until upgrading to a version with upstream
+    // fix https://github.com/slint-ui/slint/pull/13568. request_redraw() alone only
+    // schedules a frame; it does not invalidate the renderer's retained contents.
+    use slint::private_unstable_api::re_exports::{WindowInner, euclid};
+    let scale = ui.window().scale_factor();
+    let region = euclid::Rect::new(
+        euclid::point2(damage.left as f32 / scale, damage.top as f32 / scale),
+        euclid::size2(
+            (damage.right - damage.left) as f32 / scale,
+            (damage.bottom - damage.top) as f32 / scale,
+        ),
+    );
+    WindowInner::from_pub(ui.window())
+        .window_adapter()
+        .renderer()
+        .mark_dirty_region(region.into());
+}
+
 unsafe extern "system" fn native_events(
     window: HWND,
     message: u32,
@@ -836,8 +926,16 @@ unsafe extern "system" fn native_events(
     _id: usize,
     data: usize,
 ) -> LRESULT {
-    // SAFETY: run() owns this boxed Weak for the entire lifetime of the installed subclass.
-    let controller = unsafe { &*(data as *const Weak<RefCell<Controller>>) }.upgrade();
+    // SAFETY: the runtime owns this boxed reference for the lifetime of the installed subclass.
+    let events = unsafe { &*(data as *const NativeEvents) };
+    if message == WM_PAINT
+        && let Some(ui) = events.ui.upgrade()
+    {
+        // Repaint handling must also work during nested native events while the
+        // controller is borrowed (for example, when moving its child terminals).
+        mark_windows_damage(&ui, window);
+    }
+    let controller = events.controller.upgrade();
     if let Some(controller) = controller {
         if let Ok(mut state) = controller.try_borrow_mut() {
             match message {
@@ -966,6 +1064,46 @@ fn wire(ui: &Workspace, controller: &Rc<RefCell<Controller>>) {
         })
     });
     let state = controller.clone();
+    ui.on_toggle_servers(move || {
+        perform(&state, |state| {
+            let ui = state.ui.upgrade().ok_or("Workspace closed.")?;
+            if state.vault.is_some() {
+                ui.set_drawer_open(!ui.get_drawer_open());
+                state.position_terminals();
+            }
+            Ok(())
+        })
+    });
+    let state = controller.clone();
+    ui.on_open_app_menu(move || perform(&state, Controller::open_app_menu));
+    let state = controller.clone();
+    ui.on_close_app_menu(move || {
+        perform(&state, |state| {
+            state.close_app_menu();
+            Ok(())
+        })
+    });
+    let state = controller.clone();
+    ui.on_open_about(move || {
+        perform(&state, |state| {
+            state.dismiss_popups();
+            let ui = state.ui.upgrade().ok_or("Workspace closed.")?;
+            ui.set_about_open(true);
+            state.position_terminals();
+            Ok(())
+        })
+    });
+    let state = controller.clone();
+    ui.on_close_about(move || {
+        perform(&state, |state| {
+            let ui = state.ui.upgrade().ok_or("Workspace closed.")?;
+            ui.set_about_open(false);
+            state.position_terminals();
+            state.focus_terminal();
+            Ok(())
+        })
+    });
+    let state = controller.clone();
     ui.on_new_server(move || perform(&state, |state| state.edit(None)));
     let state = controller.clone();
     ui.on_edit_server(move |index| perform(&state, |state| state.edit(Some(index as usize))));
@@ -996,6 +1134,7 @@ fn wire(ui: &Workspace, controller: &Rc<RefCell<Controller>>) {
     let state = controller.clone();
     ui.on_open_shortcuts(move || {
         perform(&state, |state| {
+            state.dismiss_popups();
             let tab = state
                 .active
                 .and_then(|index| state.tabs.get(index))
@@ -1138,6 +1277,171 @@ fn preview_snapshot(ui: &Workspace, state: &Controller, name: &str) -> Result<()
         bytes,
     )
     .map_err(|error| error.to_string())
+}
+
+#[derive(Default)]
+struct NavigationSmokeState {
+    step: u8,
+    full_width: f32,
+    full_height: f32,
+}
+
+fn verify_terminal_layout(ui: &Workspace, state: &Controller) -> Result<()> {
+    let terminal = state
+        .active
+        .and_then(|index| state.tabs.get(index))
+        .map_or(state.empty_terminal, |tab| tab.terminal);
+    let mut rect = RECT::default();
+    let mut origin = POINT::default();
+    // SAFETY: these are owned preview windows; queries compare the native child against Slint's layout.
+    unsafe {
+        if IsWindowVisible(terminal) == 0 || GetWindowRect(terminal, &mut rect) == 0 {
+            return Err("The selected terminal was not restored after navigation.".into());
+        }
+        origin.x = rect.left;
+        origin.y = rect.top;
+        ScreenToClient(state.window, &mut origin);
+        let scale = GetDpiForWindow(state.window).max(96) as f32 / 96.;
+        let actual = [
+            origin.x,
+            origin.y,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        ];
+        let expected = [
+            ui.get_terminal_x(),
+            ui.get_terminal_y(),
+            ui.get_terminal_width(),
+            ui.get_terminal_height(),
+        ]
+        .map(|value| (value * scale).round() as i32);
+        if actual
+            .iter()
+            .zip(expected)
+            .any(|(actual, expected)| (actual - expected).abs() > 1)
+        {
+            return Err(
+                "Native terminal bounds did not follow the compact workspace layout.".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn navigation_smoke_test(
+    ui: &Workspace,
+    controller: &Rc<RefCell<Controller>>,
+    phase: &mut NavigationSmokeState,
+) -> Result<bool> {
+    // Separate timer turns let Winit animate and repaint normally before we inspect native bounds.
+    if phase.step == 0 {
+        phase.full_width = ui.get_terminal_width();
+        phase.full_height = ui.get_terminal_height();
+        if ui.get_drawer_open()
+            || phase.full_width
+                < ui.window().size().width as f32 / ui.window().scale_factor() * 0.95
+            || ui.get_terminal_y() > 60.
+            || phase.full_height < 500.
+        {
+            return Err(
+                "The default workspace did not give the terminal the available window space."
+                    .into(),
+            );
+        }
+        verify_terminal_layout(ui, &controller.borrow())?;
+        preview_snapshot(ui, &controller.borrow(), "slint-compact-workspace")?;
+        ui.invoke_toggle_servers();
+        phase.step = 1;
+        return Ok(false);
+    }
+    if phase.step == 1 {
+        if !ui.get_drawer_open()
+            || phase.full_width - ui.get_terminal_width() < 280.
+            || ui.get_terminal_height() != phase.full_height
+            || controller.borrow().tabs.len() != 2
+        {
+            return Err(
+                "The server drawer did not open alongside the existing session tabs.".into(),
+            );
+        }
+        verify_terminal_layout(ui, &controller.borrow())?;
+        preview_snapshot(ui, &controller.borrow(), "slint-server-drawer")?;
+        ui.invoke_toggle_servers();
+        phase.step = 2;
+        return Ok(false);
+    }
+    if ui.get_drawer_open() || (ui.get_terminal_width() - phase.full_width).abs() > 1. {
+        return Err("Closing the server drawer did not restore the terminal width.".into());
+    }
+    verify_terminal_layout(ui, &controller.borrow())?;
+    ui.invoke_open_app_menu();
+    if !ui.get_app_menu_open()
+        || ui.get_terminal_visible()
+        || ui.get_terminal_image().size().width == 0
+        || controller
+            .borrow()
+            .tabs
+            .iter()
+            .any(|tab| tab.shown || tab.input_attached)
+    {
+        return Err(
+            "The application menu did not cover and detach the native terminals safely.".into(),
+        );
+    }
+    preview_snapshot(ui, &controller.borrow(), "slint-app-menu")?;
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+            text: slint::platform::Key::Escape.into(),
+        });
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+            text: slint::platform::Key::Escape.into(),
+        });
+    if ui.get_app_menu_open() || ui.get_terminal_image().size().width != 0 {
+        return Err(
+            "Escape did not dismiss the application menu and clear its terminal image.".into(),
+        );
+    }
+    verify_terminal_layout(ui, &controller.borrow())?;
+    ui.invoke_open_app_menu();
+    for event in [
+        slint::platform::WindowEvent::PointerPressed {
+            position: slint::LogicalPosition::new(100., 100.),
+            button: slint::platform::PointerEventButton::Left,
+        },
+        slint::platform::WindowEvent::PointerReleased {
+            position: slint::LogicalPosition::new(100., 100.),
+            button: slint::platform::PointerEventButton::Left,
+        },
+    ] {
+        ui.window().dispatch_event(event);
+    }
+    if ui.get_app_menu_open() {
+        return Err("Clicking outside the application menu did not dismiss it.".into());
+    }
+    ui.invoke_open_about();
+    if !ui.get_about_open() || ui.get_terminal_visible() {
+        return Err("About did not replace the terminal view.".into());
+    }
+    ui.invoke_close_about();
+    verify_terminal_layout(ui, &controller.borrow())?;
+    ui.invoke_open_app_menu();
+    ui.invoke_lock();
+    if ui.get_app_menu_open()
+        || ui.get_drawer_open()
+        || ui.get_about_open()
+        || ui.get_terminal_image().size().width != 0
+        || ui.get_unlocked()
+    {
+        return Err("Locking did not dismiss navigation and clear its terminal image.".into());
+    }
+    ui.set_master("disposable Slint preview vault passphrase".into());
+    ui.invoke_unlock();
+    if !ui.get_unlocked() {
+        return Err("The navigation lock check could not restore the preview vault.".into());
+    }
+    verify_terminal_layout(ui, &controller.borrow())?;
+    Ok(true)
 }
 
 fn smoke_test(ui: &Workspace, controller: &Rc<RefCell<Controller>>) -> Result<()> {
@@ -1329,7 +1633,7 @@ fn smoke_test(ui: &Workspace, controller: &Rc<RefCell<Controller>>) -> Result<()
 
 struct FrontendRuntime {
     controller: Rc<RefCell<Controller>>,
-    _native_reference: Box<Weak<RefCell<Controller>>>,
+    _native_reference: Box<NativeEvents>,
     timer: slint::Timer,
     smoke_timer: slint::Timer,
 }
@@ -1427,8 +1731,11 @@ fn start_runtime(
         state.sync();
         state.position_terminals();
     }
-    let native_reference = Box::new(Rc::downgrade(&controller));
-    // SAFETY: Slint owns the parent; our subclass only supplements it and its boxed Weak outlives registration.
+    let native_reference = Box::new(NativeEvents {
+        controller: Rc::downgrade(&controller),
+        ui: ui.as_weak(),
+    });
+    // SAFETY: Slint owns the parent; our subclass only supplements it and its boxed data outlives registration.
     unsafe {
         let style = GetWindowLongPtrW(window, GWL_STYLE);
         SetWindowLongPtrW(window, GWL_STYLE, style | WS_CLIPCHILDREN as isize);
@@ -1458,13 +1765,25 @@ fn start_runtime(
         let state = controller.clone();
         let weak_ui = ui.as_weak();
         let result = smoke_result.clone();
+        let navigation = Rc::new(RefCell::new(NavigationSmokeState::default()));
+        let finished = Cell::new(false);
         smoke_timer.start(
-            slint::TimerMode::SingleShot,
-            Duration::from_millis(800),
+            slint::TimerMode::Repeated,
+            Duration::from_millis(250),
             move || {
-                if let Some(ui) = weak_ui.upgrade() {
-                    *result.borrow_mut() = smoke_test(&ui, &state);
+                if finished.get() {
+                    return;
                 }
+                if let Some(ui) = weak_ui.upgrade() {
+                    let check =
+                        match navigation_smoke_test(&ui, &state, &mut navigation.borrow_mut()) {
+                            Ok(false) => return,
+                            Ok(true) => smoke_test(&ui, &state),
+                            Err(error) => Err(error),
+                        };
+                    *result.borrow_mut() = check;
+                }
+                finished.set(true);
                 let _ = slint::quit_event_loop();
             },
         );

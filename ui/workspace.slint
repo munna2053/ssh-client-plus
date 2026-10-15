@@ -1,5 +1,5 @@
 import { ScrollView, AboutSlint, Palette, CheckBox } from "std-widgets.slint";
-import { Colors, ActionButton, Field } from "components.slint";
+import { Colors, ActionButton, MenuAction, Field } from "components.slint";
 
 export struct ServerRow { name: string, destination: string, password-login: bool }
 export struct SessionRow { name: string, running: bool }
@@ -39,17 +39,30 @@ export component Workspace inherits Window {
     in-out property <bool> password-login: false;
     in-out property <bool> shortcuts-open: false;
     in property <image> terminal-image;
-    private property <bool> about-open: false;
+    in-out property <bool> about-open: false;
+    in-out property <bool> drawer-open: false;
+    in-out property <bool> app-menu-open: false;
+    out property <length> drawer-width: root.drawer-open && root.unlocked ? 312px : 0px;
+    animate drawer-width { duration: 180ms; easing: ease-out; }
     in-out property <bool> close-confirmation-open: false;
     in property <string> closing-session-name;
     in-out property <bool> skip-close-confirmation: false;
-    out property <length> terminal-x: 348px;
-    out property <length> terminal-y: 154px;
-    out property <length> terminal-width: root.width - 372px;
-    out property <length> terminal-height: root.height - 224px;
-    out property <bool> terminal-visible: root.unlocked && !root.editor-open && !root.about-open && !root.shortcuts-open && !root.close-confirmation-open;
+    out property <length> terminal-x: 8px + root.drawer-width;
+    out property <length> terminal-y: 52px;
+    out property <length> terminal-width: root.width - root.terminal-x - 8px;
+    out property <length> terminal-height: root.height - 78px;
+    out property <bool> terminal-visible: root.unlocked && !root.editor-open && !root.about-open && !root.shortcuts-open && !root.app-menu-open && !root.close-confirmation-open;
     callback unlock;
     callback lock;
+    callback toggle-servers;
+    callback open-app-menu;
+    callback close-app-menu;
+    callback show-app-menu;
+    callback hide-app-menu;
+    callback open-about;
+    callback close-about;
+    show-app-menu => { root.app-menu-open = true; app-menu.show(); }
+    hide-app-menu => { app-menu.close(); root.app-menu-open = false; }
     callback new-server;
     callback edit-server(int);
     callback connect-server(int);
@@ -70,22 +83,30 @@ export component Workspace inherits Window {
     callback close-shortcuts;
     callback activity;
 
-    Rectangle {
-        x: 24px; y: 22px; width: 40px; height: 40px;
-        border-radius: 12px; background: Colors.accent;
-        Text { text: ">_"; color: #161125; font-size: 20px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+    ActionButton {
+        x: 8px; y: 6px; width: 100px; height: 34px;
+        text: "     Servers"; flat: !root.drawer-open; enabled: root.unlocked;
+        accessible-label: "Toggle server drawer";
+        clicked => { root.toggle-servers(); }
+        Image { x: 10px; y: 9px; width: 16px; height: 16px; source: @image-url("icons/menu.svg"); colorize: Colors.text; }
     }
-    Text { x: 78px; y: 17px; height: 32px; text: "SentinelSSH"; font-size: 24px; font-weight: 700; color: Colors.text; }
-    Text { x: 78px; y: 51px; text: "Your private server workspace"; font-size: 12px; color: Colors.muted; }
-    Text { x: root.width - 365px; y: 34px; text: root.unlocked ? "●  Vault unlocked" : "●  Vault locked"; color: root.unlocked ? Colors.green : Colors.muted; font-size: 12px; }
-    ActionButton { x: root.width - 180px; y: 25px; width: 156px; text: "Lock vault"; enabled: root.unlocked; clicked => { root.lock(); } }
+    ActionButton {
+        x: root.width - 44px; y: 6px; width: 36px; height: 34px;
+        flat: !root.app-menu-open; accessible-label: "Application menu";
+        clicked => { root.open-app-menu(); }
+        Image { x: 8px; y: 7px; width: 20px; height: 20px; source: @image-url("icons/more.svg"); colorize: Colors.text; }
+    }
+    Rectangle { x: 0px; y: 44px; width: root.width; height: 1px; background: #202b3c; }
 
     Rectangle {
-        x: 24px; y: 94px; width: 300px; height: root.height - 146px;
-        background: Colors.panel; border-radius: 14px;
+        x: 8px; y: root.terminal-y; width: max(0px, root.drawer-width - 8px); height: root.terminal-height;
+        clip: true; visible: root.drawer-width > 0px;
+        Rectangle {
+        x: parent.width - self.width; width: 304px; height: parent.height;
+        background: Colors.panel; border-radius: 10px;
         border-width: 1px; border-color: #202b3c;
-        Text { x: 18px; y: 19px; text: "SERVERS"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: Colors.muted; }
-        Text { x: parent.width - 46px; y: 19px; text: root.servers.length; color: Colors.muted; font-size: 11px; }
+        Text { x: 16px; y: 19px; text: "SERVERS  ·  " + root.servers.length; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: Colors.muted; }
+        ActionButton { x: parent.width - 40px; y: 10px; width: 28px; height: 28px; text: "×"; flat: true; accessible-label: "Close server drawer"; clicked => { root.toggle-servers(); } }
         if !root.unlocked || root.servers.length == 0 : Text {
             x: 18px; y: 67px; width: parent.width - 36px; wrap: word-wrap;
             text: !root.unlocked ? "Unlock your vault to see your servers." : "Your workspace is ready.\nAdd your first server below.";
@@ -106,53 +127,51 @@ export component Workspace inherits Window {
                 Text { x: 14px; y: 37px; width: parent.width - 28px; height: 19px; text: server.destination; color: Colors.muted; font-size: 12px; overflow: elide; }
                 HorizontalLayout {
                     x: 12px; y: 65px; width: parent.width - 24px; height: 30px; spacing: 8px;
-                    ActionButton { height: 30px; text: "Connect"; primary: true; clicked => { root.connect-server(index); } }
-                    ActionButton { height: 30px; text: "Edit"; clicked => { root.edit-server(index); } }
+                    ActionButton { height: 30px; text: "Connect"; primary: true; enabled: root.drawer-open; clicked => { root.connect-server(index); } }
+                    ActionButton { height: 30px; text: "Edit"; enabled: root.drawer-open; clicked => { root.edit-server(index); } }
                 }
             }
         }
-        ActionButton { x: 14px; y: parent.height - 52px; width: parent.width - 28px; height: 38px; text: "+   New server"; enabled: root.unlocked; clicked => { root.new-server(); } }
+        ActionButton { x: 14px; y: parent.height - 52px; width: parent.width - 28px; height: 38px; text: "+   New server"; enabled: root.unlocked && root.drawer-open; clicked => { root.new-server(); } }
+        }
     }
 
     if root.unlocked : Rectangle {
-        x: 348px; y: 94px; width: root.width - 372px; height: 42px; background: transparent;
+        x: 116px; y: 6px; width: root.width - 300px; height: 34px; background: transparent;
         ScrollView {
             x: 0px; y: 0px;
-            width: parent.width - 168px; height: 48px;
-            viewport-height: 40px;
-            viewport-width: max(self.width, root.sessions.length * 186px);
+            width: parent.width; height: 38px;
+            viewport-height: 34px;
+            viewport-width: max(self.width, root.sessions.length * 178px);
             for session[index] in root.sessions : Rectangle {
-                x: index * 186px; y: 0px; width: 178px; height: 40px;
+                x: index * 178px; y: 0px; width: 172px; height: 34px;
                 background: root.active-session == index && !root.editor-open ? #2b3550 : tab-touch.has-hover ? #202d43 : Colors.panel;
                 border-radius: 9px;
                 border-width: 1px; border-color: root.active-session == index && !root.editor-open ? #756592 : Colors.border;
                 animate background, border-color { duration: 150ms; }
                 tab-touch := TouchArea { mouse-cursor: pointer; clicked => { root.select-session(index); } }
-                Rectangle { x: 12px; y: 17px; width: 6px; height: 6px; border-radius: 3px; background: session.running ? Colors.green : Colors.muted; }
+                Rectangle { x: 12px; y: 14px; width: 6px; height: 6px; border-radius: 3px; background: session.running ? Colors.green : Colors.muted; }
                 Text { x: 26px; width: parent.width - 61px; height: parent.height; text: session.name; color: Colors.text; overflow: elide; vertical-alignment: center; font-size: 13px; }
-                ActionButton { x: parent.width - 31px; y: 5px; width: 26px; height: 30px; text: "×"; clicked => { root.close-session(index); } }
+                ActionButton { x: parent.width - 31px; y: 3px; width: 26px; height: 28px; text: "×"; flat: true; accessible-label: "Close " + session.name + " session"; clicked => { root.close-session(index); } }
             }
         }
+    }
         ActionButton {
-            x: parent.width - 150px; y: 2px; width: 150px; text: "Shortcuts   ▾";
+            x: root.width - 176px; y: 6px; width: 124px; height: 34px; text: "Shortcuts    "; flat: true;
             enabled: root.active-running;
             clicked => { if root.shortcuts-open { root.close-shortcuts(); } else { root.open-shortcuts(); } }
+            Image { x: parent.width - 24px; y: 11px; width: 12px; height: 12px; source: @image-url("icons/chevron-down.svg"); colorize: Colors.text; }
         }
-    }
 
     if root.unlocked && !root.editor-open && !root.about-open : Rectangle {
         x: root.terminal-x - 1px; y: root.terminal-y - 1px;
         width: root.terminal-width + 2px; height: root.terminal-height + 2px;
         background: #0b1018; border-width: 1px; border-color: Colors.border; border-radius: 10px;
-        if root.shortcuts-open : Image { source: root.terminal-image; x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; image-fit: fill; }
-    }
-    if root.terminal-visible : Text {
-        x: 348px; y: root.height - 55px; color: Colors.muted; font-size: 11px;
-        text: "Ctrl+Shift+C  Copy     Ctrl+Shift+V  Paste     Scroll for history";
+        if root.shortcuts-open || root.app-menu-open : Image { source: root.terminal-image; x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; image-fit: fill; }
     }
 
     if !root.unlocked : Rectangle {
-        x: 348px + (root.terminal-width - self.width) / 2;
+        x: root.terminal-x + (root.terminal-width - self.width) / 2;
         y: max(115px, (root.height - self.height) / 2);
         width: min(480px, root.terminal-width - 32px);
         height: root.creating ? 420px : 340px;
@@ -170,7 +189,7 @@ export component Workspace inherits Window {
     }
 
     if root.unlocked && root.editor-open : Rectangle {
-        x: 348px; y: 154px; width: root.terminal-width; height: root.terminal-height;
+        x: root.terminal-x; y: root.terminal-y; width: root.terminal-width; height: root.terminal-height;
         background: transparent;
         ScrollView {
             viewport-width: self.width;
@@ -242,7 +261,7 @@ export component Workspace inherits Window {
 
     if root.shortcuts-open : TouchArea { clicked => { root.close-shortcuts(); } }
     if root.shortcuts-open && root.unlocked && root.active-running : Rectangle {
-        x: root.width - 214px; y: 139px; width: 190px; height: 174px;
+        x: root.width - 242px; y: 46px; width: 190px; height: 174px;
         background: Colors.panel; border-width: 1px; border-color: Colors.border; border-radius: 10px;
         VerticalLayout {
             padding: 10px; spacing: 5px;
@@ -253,19 +272,57 @@ export component Workspace inherits Window {
         }
     }
 
-    Rectangle { x: 24px; y: root.height - 34px; height: 1px; width: root.width - 48px; background: #202b3c; }
-    Text { x: 24px; y: root.height - 26px; width: root.width - 132px; text: root.status; color: Colors.muted; font-size: 11px; overflow: elide; }
-    ActionButton { x: root.width - 89px; y: root.height - 29px; width: 65px; height: 24px; text: "About"; clicked => { root.about-open = !root.about-open; root.activity(); } }
+    Text { x: 8px; y: root.height - 19px; width: root.width - 16px; text: root.status; color: Colors.muted; font-size: 11px; overflow: elide; }
     if root.about-open : Rectangle {
-        x: 348px; y: 154px; width: root.terminal-width; height: root.terminal-height;
+        x: root.terminal-x; y: root.terminal-y; width: root.terminal-width; height: root.terminal-height;
         background: Colors.canvas;
         VerticalLayout {
             padding: 30px; spacing: 20px;
             Text { text: "SentinelSSH"; color: Colors.text; font-size: 28px; font-weight: 700; }
             Text { text: "A private Windows workspace for your SSH servers."; color: Colors.muted; }
             AboutSlint { }
-            ActionButton { width: 130px; text: "Back"; clicked => { root.about-open = false; } }
+            ActionButton { width: 130px; text: "Back"; clicked => { root.close-about(); } }
             Rectangle { vertical-stretch: 1; }
+        }
+    }
+
+    app-menu := PopupWindow {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        close-policy: PopupClosePolicy.no-auto-close;
+        FocusScope {
+            key-pressed(event) => {
+                if event.text == Key.Escape { root.close-app-menu(); return accept; }
+                return reject;
+            }
+            TouchArea { clicked => { root.close-app-menu(); } }
+            Rectangle {
+                x: root.width - 300px; y: 46px; width: 292px; height: 374px;
+                background: Colors.panel; border-radius: 10px; border-width: 1px; border-color: Colors.border;
+                init => { if root.unlocked { menu-new.take-focus(); } else { menu-about.take-focus(); } }
+                TouchArea { }
+                VerticalLayout {
+                    padding: 12px; spacing: 4px;
+                    Rectangle {
+                        height: 58px;
+                        Rectangle {
+                            x: 8px; y: 8px; width: 34px; height: 34px;
+                            background: Colors.accent; border-radius: 10px;
+                            Text { text: ">_"; color: #161125; font-size: 17px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Text { x: 54px; y: 5px; text: "SentinelSSH"; font-size: 16px; font-weight: 600; color: Colors.text; }
+                        Text { x: 54px; y: 30px; text: root.unlocked ? "●  Vault unlocked" : "●  Vault locked"; color: root.unlocked ? Colors.green : Colors.muted; font-size: 11px; }
+                    }
+                    Rectangle { height: 1px; background: Colors.border; }
+                    menu-new := MenuAction { label: "New server"; enabled: root.unlocked; clicked => { root.close-app-menu(); root.new-server(); } }
+                    MenuAction { label: root.drawer-open ? "Hide servers" : "Show servers"; enabled: root.unlocked; clicked => { root.close-app-menu(); root.toggle-servers(); } }
+                    MenuAction { label: "Lock vault"; enabled: root.unlocked; clicked => { root.close-app-menu(); root.lock(); } }
+                    Rectangle { height: 1px; background: Colors.border; }
+                    menu-about := MenuAction { label: "About SentinelSSH"; clicked => { root.close-app-menu(); root.open-about(); } }
+                    Rectangle { height: 1px; background: Colors.border; }
+                    Text { height: 22px; text: "KEYBOARD SHORTCUTS"; color: Colors.muted; font-size: 10px; font-weight: 600; vertical-alignment: center; }
+                    Text { text: "Ctrl+Shift+C   Copy\nCtrl+Shift+V   Paste\nShift+PgUp / PgDn   History"; color: Colors.muted; font-size: 11px; }
+                }
+            }
         }
     }
 
