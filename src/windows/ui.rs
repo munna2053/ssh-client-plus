@@ -26,6 +26,7 @@ use windows_sys::Win32::{
         Controls::*,
         HiDpi::*,
         Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus},
+        Shell::{DefSubclassProc, SetWindowSubclass},
         WindowsAndMessaging::*,
     },
 };
@@ -46,7 +47,6 @@ const SERVER_PASSWORD: usize = 117;
 const NEW: usize = 120;
 const SAVE: usize = 121;
 const DELETE: usize = 122;
-const CONNECT: usize = 123;
 const SYSTEM: usize = 130;
 const UPTIME: usize = 131;
 const DISK: usize = 132;
@@ -54,13 +54,34 @@ const MEMORY: usize = 133;
 const STATUS: usize = 140;
 const IDENTITY_NOTE: usize = 141;
 const TERMINAL: usize = 150;
-const TAB_TERMINAL: usize = 151;
-const TAB_DETAILS: usize = 152;
-const DISCONNECT: usize = 153;
-const ACTIVE_TITLE: usize = 154;
 const TERMINAL_HINT: usize = 155;
 const LIST_HINT: usize = 156;
 const VAULT_BADGE: usize = 157;
+const SHORTCUTS: usize = 158;
+const CLOSE_EDITOR: usize = 159;
+const PREVIOUS_TABS: usize = 160;
+const NEXT_TABS: usize = 161;
+const CARD_BUTTON_BASE: usize = 3000;
+const SESSION_BUTTON_BASE: usize = 6000;
+const SESSION_TERMINAL_BASE: usize = 10000;
+const MAX_SESSION_TABS: usize = 16;
+const SERVER_ROW_HEIGHT: i32 = 100;
+const POSITION_CARDS: u32 = WM_APP + 210;
+
+struct SessionTab {
+    slot: usize,
+    name: String,
+    terminal: HWND,
+    session: Option<SshSession>,
+    exit_code: Option<u32>,
+}
+
+const SHORTCUT_ACTIONS: [(usize, &str, ReadOnlyAction); 4] = [
+    (SYSTEM, "System info", ReadOnlyAction::System),
+    (UPTIME, "Uptime", ReadOnlyAction::Uptime),
+    (DISK, "Disk usage", ReadOnlyAction::Disk),
+    (MEMORY, "Memory", ReadOnlyAction::Memory),
+];
 
 struct State {
     paths: AppPaths,
@@ -73,11 +94,12 @@ struct State {
     last_activity: Instant,
     retry_after: Instant,
     failures: u32,
-    children: Vec<SshSession>,
+    tabs: Vec<SessionTab>,
+    active_tab: Option<usize>,
+    tab_offset: usize,
     window: HWND,
     theme: Theme,
     details: bool,
-    active_label: String,
 }
 
 impl State {
@@ -95,11 +117,12 @@ impl State {
             last_activity: Instant::now(),
             retry_after: Instant::now(),
             failures: 0,
-            children: vec![],
+            tabs: vec![],
+            active_tab: None,
+            tab_offset: 0,
             window: null_mut(),
             theme: Theme::new(96)?,
             details: false,
-            active_label: String::new(),
         })
     }
 
@@ -108,6 +131,144 @@ impl State {
             .iter()
             .find(|(candidate, _)| *candidate == id)
             .map_or(null_mut(), |(_, handle)| *handle)
+    }
+
+    fn active(&self) -> Option<&SessionTab> {
+        self.active_tab
+            .and_then(|slot| self.tabs.iter().find(|tab| tab.slot == slot))
+    }
+
+    fn active_terminal(&self) -> HWND {
+        self.active()
+            .map_or(self.control(TERMINAL), |tab| tab.terminal)
+    }
+
+    fn remove_controls(&mut self, start: usize, end: usize) {
+        self.controls.retain(|&(id, handle)| {
+            if (start..end).contains(&id) {
+                // SAFETY: this control is owned by the window and is removed from the registry exactly once.
+                unsafe {
+                    DestroyWindow(handle);
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn tab_range(&self) -> (usize, usize, bool) {
+        let area = (self.bounds().0 - 338 - 24 - 162).max(180);
+        let overflow = self.tabs.len() > (area / 180).max(1) as usize;
+        let count = ((area - if overflow { 64 } else { 0 }) / 180).max(1) as usize;
+        let start = self.tab_offset.min(self.tabs.len().saturating_sub(count));
+        (start, count, overflow)
+    }
+
+    fn reveal_active_tab(&mut self) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| Some(tab.slot) == self.active_tab)
+        else {
+            return;
+        };
+        let (start, count, _) = self.tab_range();
+        if index < start {
+            self.tab_offset = index;
+        } else if index >= start + count {
+            self.tab_offset = index + 1 - count;
+        }
+    }
+
+    fn open_tab(&mut self, name: String, session: Option<SshSession>) -> Result<usize> {
+        let slot = (0..MAX_SESSION_TABS)
+            .find(|slot| self.tabs.iter().all(|tab| tab.slot != *slot))
+            .ok_or("Close a session tab before opening another; up to 16 tabs are supported.")?;
+        let terminal = terminal_view::create(self.window, SESSION_TERMINAL_BASE + slot)?;
+        let base = SESSION_BUTTON_BASE + slot * 2;
+        let buttons = (|| {
+            self.add(
+                self.window,
+                "BUTTON",
+                &name,
+                base,
+                WS_TABSTOP | BS_OWNERDRAW as u32,
+                [0, 0, 1, 1],
+            )?;
+            self.add(
+                self.window,
+                "BUTTON",
+                "\u{00d7}",
+                base + 1,
+                WS_TABSTOP | BS_OWNERDRAW as u32,
+                [0, 0, 1, 1],
+            )
+        })();
+        if let Err(error) = buttons {
+            self.remove_controls(base, base + 2);
+            // SAFETY: this terminal was created above and has not been added to the session registry.
+            unsafe {
+                DestroyWindow(terminal);
+            }
+            return Err(error);
+        }
+        self.tabs.push(SessionTab {
+            slot,
+            name,
+            terminal,
+            session,
+            exit_code: None,
+        });
+        self.active_tab = Some(slot);
+        self.details = false;
+        self.reveal_active_tab();
+        self.refresh_enabled();
+        // SAFETY: the active terminal has been laid out and belongs to this UI thread.
+        unsafe {
+            SetFocus(terminal);
+        }
+        Ok(slot)
+    }
+
+    fn close_tab(&mut self, slot: usize) -> Result<()> {
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.slot == slot)
+            .ok_or("Session tab no longer exists.")?;
+        let mut tab = self.tabs.remove(index);
+        terminal_view::attach(tab.terminal, None, false);
+        if let Some(mut session) = tab.session.take() {
+            session.cancel_pending_credentials();
+            session.finish_output();
+        }
+        self.remove_controls(
+            SESSION_BUTTON_BASE + slot * 2,
+            SESSION_BUTTON_BASE + slot * 2 + 2,
+        );
+        // SAFETY: the removed tab owns this live terminal window; no session references its view now.
+        unsafe {
+            DestroyWindow(tab.terminal);
+        }
+        if self.active_tab == Some(slot) {
+            self.active_tab = self
+                .tabs
+                .get(index.min(self.tabs.len().saturating_sub(1)))
+                .map(|tab| tab.slot);
+        }
+        self.reveal_active_tab();
+        self.refresh_enabled();
+        // SAFETY: focus returns to the visible editor or current terminal after the tab closes.
+        unsafe {
+            SetFocus(if self.details {
+                self.control(NAME)
+            } else {
+                self.active_terminal()
+            });
+        }
+        self.set(STATUS, "Session tab closed.");
+        Ok(())
     }
 
     fn add(
@@ -159,8 +320,7 @@ impl State {
             (200, "SentinelSSH"),
             (202, "Your private server workspace"),
             (205, "SERVERS"),
-            (206, "Select a server"),
-            (207, "Add a server or choose one from the sidebar."),
+            (206, "New server"),
             (203, "Vault master passphrase"),
             (204, "Confirm passphrase"),
             (208, "Unlock your workspace"),
@@ -168,8 +328,6 @@ impl State {
                 209,
                 "Your servers and saved passwords are protected by your vault key.",
             ),
-            (220, "QUICK CHECKS"),
-            (ACTIVE_TITLE, "No active session"),
             (
                 TERMINAL_HINT,
                 "Ctrl+Shift+C to copy   |   Ctrl+Shift+V to paste   |   Scroll for history",
@@ -183,11 +341,7 @@ impl State {
                 "STATIC",
                 text,
                 id,
-                if matches!(id, 206 | 207 | ACTIVE_TITLE) {
-                    SS_ENDELLIPSIS
-                } else {
-                    0
-                },
+                if id == 206 { SS_ENDELLIPSIS } else { 0 },
                 [0, 0, 1, 1],
             )?;
         }
@@ -236,17 +390,13 @@ impl State {
         for (id, label) in [
             (UNLOCK, "Unlock vault"),
             (LOCK, "Lock vault"),
-            (NEW, "+ New server"),
+            (NEW, "New server"),
             (DELETE, "Delete"),
             (SAVE, "Save server"),
-            (CONNECT, "Connect"),
-            (DISCONNECT, "Disconnect"),
-            (TAB_TERMINAL, "Terminal"),
-            (TAB_DETAILS, "Server details"),
-            (SYSTEM, "System"),
-            (UPTIME, "Uptime"),
-            (DISK, "Disk"),
-            (MEMORY, "Memory"),
+            (SHORTCUTS, "Shortcuts \u{25be}"),
+            (CLOSE_EDITOR, "Done"),
+            (PREVIOUS_TABS, "\u{2039}"),
+            (NEXT_TABS, "\u{203a}"),
         ] {
             self.add(window, "BUTTON", label, id, button, [0, 0, 1, 1])?;
         }
@@ -257,12 +407,21 @@ impl State {
             LIST,
             WS_VSCROLL
                 | WS_TABSTOP
+                | WS_CLIPCHILDREN
                 | LBS_NOTIFY as u32
                 | LBS_OWNERDRAWFIXED as u32
                 | LBS_HASSTRINGS as u32
                 | LBS_NOINTEGRALHEIGHT as u32,
             [0, 0, 1, 1],
         )?;
+        // SAFETY: the list is a live container; subclass forwards its child-button messages to this window.
+        unsafe {
+            let list = self.control(LIST);
+            SetWindowLongPtrW(list, GWL_EXSTYLE, WS_EX_CONTROLPARENT as isize);
+            if SetWindowSubclass(list, Some(server_list_proc), 1, 0) == 0 {
+                return Err("Cannot initialize server card controls.".into());
+            }
+        }
         self.add(
             window,
             "COMBOBOX",
@@ -289,7 +448,7 @@ impl State {
                 self.control(LIST),
                 LB_SETITEMHEIGHT,
                 0,
-                theme::scale(58, self.theme.dpi) as isize,
+                theme::scale(SERVER_ROW_HEIGHT, self.theme.dpi) as isize,
             );
             for id in [PASSWORD, CONFIRM] {
                 SendMessageW(self.control(id), EM_SETLIMITTEXT, 1024, 0);
@@ -422,30 +581,10 @@ impl State {
             },
         );
         if let Some(host) = self.selected.and_then(|index| self.hosts.get(index)) {
-            self.set(206, &host.name);
-            self.set(
-                207,
-                &format!("{}@{}:{}", host.username, host.address, host.port),
-            );
+            self.set(206, &format!("Edit {}", host.name));
         } else {
-            self.set(
-                206,
-                if self.details {
-                    "New server"
-                } else {
-                    "Select a server"
-                },
-            );
-            self.set(207, "Add a server or choose one from the sidebar.");
+            self.set(206, "New server");
         }
-        self.set(
-            ACTIVE_TITLE,
-            if self.children.is_empty() {
-                "No active session"
-            } else {
-                &self.active_label
-            },
-        );
     }
 
     fn layout(&self) {
@@ -458,68 +597,109 @@ impl State {
         self.place(LOCK, width - 158, 24, 134, 34);
         self.place(VAULT_BADGE, width - 352, 32, 178, 23);
         self.place(205, 36, 110, 240, 22);
-        self.place(LIST, 32, 148, 268, (height - 386).max(70));
+        self.place(LIST, 32, 148, 268, (height - 270).max(70));
         self.place(LIST_HINT, 48, 175, 232, 70);
         self.visible(LIST_HINT, self.hosts.is_empty());
-        self.place(220, 36, height - 218, 240, 20);
-        for (id, x, y) in [
-            (SYSTEM, 32, height - 188),
-            (UPTIME, 172, height - 188),
-            (DISK, 32, height - 147),
-            (MEMORY, 172, height - 147),
-            (NEW, 32, height - 104),
-            (DELETE, 172, height - 104),
-        ] {
-            self.place(id, x, y, 128, 34);
-        }
+        self.place(NEW, 32, height - 104, 268, 34);
         self.place(STATUS, 24, height - 49, width - 48, 40);
-        self.place(206, left, 106, main - 265, 28);
-        self.place(207, left, 139, main - 265, 22);
-        self.place(CONNECT, width - 277, 112, 139, 38);
-        self.place(DISCONNECT, width - 128, 112, 104, 38);
-        self.place(TAB_TERMINAL, left, 176, 103, 32);
-        self.place(TAB_DETAILS, left + 112, 176, 130, 32);
-        self.place(ACTIVE_TITLE, left + 260, 184, main - 260, 22);
-        self.place(TERMINAL, left, 224, main, height - 312);
+        self.place(206, left, 151, main - 170, 30);
+        self.place(CLOSE_EDITOR, width - 170, 148, 146, 34);
+        self.visible(206, unlocked && self.details);
+        self.visible(CLOSE_EDITOR, unlocked && self.details);
+        self.place(SHORTCUTS, width - 170, 96, 146, 34);
+        self.visible(SHORTCUTS, unlocked);
+        self.place(TERMINAL, left, 148, main, height - 236);
         self.place(TERMINAL_HINT, left, height - 79, main, 23);
-        for id in [
-            206,
-            207,
-            CONNECT,
-            DISCONNECT,
-            TAB_TERMINAL,
-            TAB_DETAILS,
-            ACTIVE_TITLE,
-        ] {
-            self.visible(id, unlocked);
+        let (start, count, overflow) = self.tab_range();
+        self.place(PREVIOUS_TABS, left, 96, 26, 34);
+        self.place(NEXT_TABS, width - 202, 96, 26, 34);
+        self.visible(PREVIOUS_TABS, unlocked && overflow);
+        self.visible(NEXT_TABS, unlocked && overflow);
+        let tab_left = left + if overflow { 32 } else { 0 };
+        let tab_area = main - 162 - if overflow { 64 } else { 0 };
+        let tab_width = (tab_area / count as i32).clamp(120, 210);
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let show_tab = unlocked && index >= start && index < start + count;
+            let id = SESSION_BUTTON_BASE + tab.slot * 2;
+            if show_tab {
+                let x = tab_left + (index - start) as i32 * tab_width;
+                self.place(id, x, 94, tab_width - 34, 38);
+                self.place(id + 1, x + tab_width - 32, 94, 28, 38);
+            }
+            self.visible(id, show_tab);
+            self.visible(id + 1, show_tab);
+            let shown = unlocked && !self.details && self.active_tab == Some(tab.slot);
+            let s = |v| theme::scale(v, self.theme.dpi);
+            // SAFETY: each tab owns a live child terminal; only the selected tab is visible and accepts input.
+            unsafe {
+                MoveWindow(
+                    tab.terminal,
+                    s(left),
+                    s(148),
+                    s(main),
+                    s((height - 236).max(1)),
+                    0,
+                );
+                ShowWindow(tab.terminal, if shown { SW_SHOWNA } else { SW_HIDE });
+            }
+            terminal_view::attach(
+                tab.terminal,
+                if shown {
+                    tab.session.as_ref().map(SshSession::input)
+                } else {
+                    None
+                },
+                false,
+            );
         }
-        self.visible(TERMINAL, unlocked && !self.details);
+        self.visible(
+            TERMINAL,
+            unlocked && !self.details && self.active().is_none(),
+        );
         self.visible(TERMINAL_HINT, unlocked && !self.details);
+        // SAFETY: paging controls are live and remain available only when another page exists.
+        unsafe {
+            EnableWindow(
+                self.control(PREVIOUS_TABS),
+                i32::from(unlocked && start > 0),
+            );
+            EnableWindow(
+                self.control(NEXT_TABS),
+                i32::from(unlocked && start + count < self.tabs.len()),
+            );
+            EnableWindow(
+                self.control(SHORTCUTS),
+                i32::from(unlocked && self.active().is_some_and(|tab| tab.session.is_some())),
+            );
+        }
+        self.position_card_buttons();
         let form = main.min(760);
         let step = ((height - 385) / 5).clamp(49, 68);
         for (id, x, y, w) in [
-            (NAME, left, 225, form),
-            (ADDRESS, left, 225 + step, form - 120),
-            (PORT, left + form - 102, 225 + step, 102),
-            (USERNAME, left, 225 + step * 2, form / 2 - 10),
-            (IDENTITY, left, 225 + step * 3, form),
-            (SERVER_PASSWORD, left, 225 + step * 4, form),
+            (NAME, left, 201, form),
+            (ADDRESS, left, 201 + step, form - 120),
+            (PORT, left + form - 102, 201 + step, 102),
+            (USERNAME, left, 201 + step * 2, form / 2 - 10),
+            (IDENTITY, left, 201 + step * 3, form),
+            (SERVER_PASSWORD, left, 201 + step * 4, form),
         ] {
             self.place(id + 300, x, y, w, 20);
             self.place(id, x, y + 23, w, 26);
             self.visible(id + 300, unlocked && self.details);
             self.visible(id, unlocked && self.details);
         }
-        self.place(416, left + form / 2 + 10, 225 + step * 2, form / 2 - 10, 20);
+        self.place(416, left + form / 2 + 10, 201 + step * 2, form / 2 - 10, 20);
         self.place(
             AUTHENTICATION,
             left + form / 2 + 10,
-            248 + step * 2,
+            224 + step * 2,
             form / 2 - 10,
             160,
         );
-        self.place(IDENTITY_NOTE, left, 278 + step * 4, form, 33);
-        self.place(SAVE, left, 320 + step * 4, 146, 34);
+        self.place(IDENTITY_NOTE, left, 254 + step * 4, form, 33);
+        self.place(SAVE, left, 296 + step * 4, 146, 34);
+        self.place(DELETE, left + 158, 296 + step * 4, 104, 34);
+        self.visible(DELETE, unlocked && self.details && self.selected.is_some());
         for id in [416, AUTHENTICATION, IDENTITY_NOTE, SAVE] {
             self.visible(id, unlocked && self.details);
         }
@@ -591,7 +771,7 @@ impl State {
             if self.vault.is_some() && !self.details {
                 theme::rounded(
                     dc,
-                    &rect(337, 223, width - 360, height - 310),
+                    &rect(337, 147, width - 360, height - 234),
                     theme::BORDER,
                     s(8),
                 );
@@ -609,10 +789,28 @@ impl State {
                 return;
             };
             let chosen = item.itemState & ODS_SELECTED != 0;
-            if chosen {
-                theme::rounded(dc, &item.rcItem, theme::SELECTED, s(10));
-            }
-            let rect = item.rcItem;
+            let rect = RECT {
+                left: item.rcItem.left + s(1),
+                top: item.rcItem.top + s(3),
+                right: item.rcItem.right - s(1),
+                bottom: item.rcItem.bottom - s(3),
+            };
+            theme::rounded(dc, &rect, theme::BORDER, s(10));
+            theme::rounded(
+                dc,
+                &RECT {
+                    left: rect.left + s(1),
+                    top: rect.top + s(1),
+                    right: rect.right - s(1),
+                    bottom: rect.bottom - s(1),
+                },
+                if chosen {
+                    theme::SELECTED
+                } else {
+                    theme::INPUT
+                },
+                s(9),
+            );
             if chosen {
                 theme::rounded(
                     dc,
@@ -630,9 +828,9 @@ impl State {
                 dc,
                 RECT {
                     left: rect.left + s(16),
-                    top: rect.top + s(7),
+                    top: rect.top + s(6),
                     right: rect.right - s(10),
-                    bottom: rect.top + s(29),
+                    bottom: rect.top + s(28),
                 },
                 &host.name,
                 self.theme.body.0,
@@ -643,9 +841,9 @@ impl State {
                 dc,
                 RECT {
                     left: rect.left + s(16),
-                    top: rect.top + s(30),
+                    top: rect.top + s(29),
                     right: rect.right - s(10),
-                    bottom: rect.bottom - s(4),
+                    bottom: rect.top + s(52),
                 },
                 &format!("{}@{}:{}", host.username, host.address, host.port),
                 self.theme.body.0,
@@ -654,35 +852,122 @@ impl State {
             );
         } else {
             let disabled = item.itemState & ODS_DISABLED != 0;
-            let primary = matches!(id, UNLOCK | CONNECT | SAVE)
-                || (id == TAB_TERMINAL && !self.details)
-                || (id == TAB_DETAILS && self.details);
+            let card = (CARD_BUTTON_BASE..SESSION_BUTTON_BASE).contains(&id);
+            let card_index = id.saturating_sub(CARD_BUTTON_BASE) / 2;
+            let tab = if (SESSION_BUTTON_BASE..SESSION_BUTTON_BASE + MAX_SESSION_TABS * 2)
+                .contains(&id)
+            {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.slot == (id - SESSION_BUTTON_BASE) / 2)
+            } else {
+                None
+            };
+            let primary =
+                matches!(id, UNLOCK | SAVE) || (card && (id - CARD_BUTTON_BASE).is_multiple_of(2));
             let background = if disabled {
                 theme::PANEL
-            } else if item.itemState & ODS_SELECTED != 0 {
+            } else if item.itemState & ODS_SELECTED != 0
+                || tab.is_some_and(|tab| Some(tab.slot) == self.active_tab && !self.details)
+            {
                 theme::SELECTED
             } else if primary {
                 theme::ACCENT
+            } else if card {
+                theme::BORDER
             } else {
                 theme::INPUT
             };
             theme::fill(
                 dc,
                 &item.rcItem,
-                if matches!(id, NEW | DELETE | SYSTEM | UPTIME | DISK | MEMORY) {
+                if card {
+                    if self.selected == Some(card_index) {
+                        theme::SELECTED
+                    } else {
+                        theme::INPUT
+                    }
+                } else if id == NEW {
                     theme::PANEL
                 } else {
                     theme::CANVAS
                 },
             );
             theme::rounded(dc, &item.rcItem, background, s(9));
+            let mut label_rect = item.rcItem;
+            if let Some(tab) = tab
+                && (id - SESSION_BUTTON_BASE).is_multiple_of(2)
+            {
+                let middle = (item.rcItem.top + item.rcItem.bottom) / 2;
+                theme::rounded(
+                    dc,
+                    &RECT {
+                        left: item.rcItem.left + s(10),
+                        top: middle - s(3),
+                        right: item.rcItem.left + s(16),
+                        bottom: middle + s(3),
+                    },
+                    if tab.session.is_some() {
+                        theme::GREEN
+                    } else {
+                        theme::MUTED
+                    },
+                    s(6),
+                );
+                label_rect.left += s(24);
+                label_rect.right -= s(6);
+            }
+            if id == NEW {
+                let icon = RECT {
+                    left: item.rcItem.left + s(14),
+                    top: (item.rcItem.top + item.rcItem.bottom - s(22)) / 2,
+                    right: item.rcItem.left + s(36),
+                    bottom: (item.rcItem.top + item.rcItem.bottom + s(22)) / 2,
+                };
+                theme::rounded(dc, &icon, theme::SELECTED, s(6));
+                let color = if disabled {
+                    theme::MUTED
+                } else {
+                    theme::ACCENT
+                };
+                theme::fill(
+                    dc,
+                    &RECT {
+                        left: icon.left + s(5),
+                        top: icon.top + s(10),
+                        right: icon.right - s(5),
+                        bottom: icon.top + s(12),
+                    },
+                    color,
+                );
+                theme::fill(
+                    dc,
+                    &RECT {
+                        left: icon.left + s(10),
+                        top: icon.top + s(5),
+                        right: icon.left + s(12),
+                        bottom: icon.bottom - s(5),
+                    },
+                    color,
+                );
+                label_rect.left += s(48);
+            }
             theme::text(
                 dc,
-                item.rcItem,
+                label_rect,
                 &self.text(id),
                 self.theme.body.0,
                 if disabled { theme::MUTED } else { theme::TEXT },
-                DT_SINGLELINE | DT_CENTER | DT_VCENTER,
+                DT_SINGLELINE
+                    | DT_VCENTER
+                    | DT_END_ELLIPSIS
+                    | if id == NEW
+                        || (tab.is_some() && (id - SESSION_BUTTON_BASE).is_multiple_of(2))
+                    {
+                        DT_LEFT
+                    } else {
+                        DT_CENTER
+                    },
             );
             if item.itemState & ODS_FOCUS != 0 {
                 let mut rect = item.rcItem;
@@ -719,7 +1004,7 @@ impl State {
                 self.control(LIST),
                 LB_SETITEMHEIGHT,
                 0,
-                theme::scale(58, dpi) as isize,
+                theme::scale(SERVER_ROW_HEIGHT, dpi) as isize,
             );
         }
         self.theme = theme;
@@ -775,14 +1060,8 @@ impl State {
                 NEW,
                 SAVE,
                 DELETE,
-                CONNECT,
-                SYSTEM,
-                UPTIME,
-                DISK,
-                MEMORY,
                 LOCK,
-                TAB_TERMINAL,
-                TAB_DETAILS,
+                CLOSE_EDITOR,
             ] {
                 EnableWindow(self.control(id), i32::from(unlocked));
             }
@@ -793,21 +1072,8 @@ impl State {
             );
             EnableWindow(self.control(UNLOCK), i32::from(!unlocked));
             EnableWindow(self.control(SHOW_MASTER), i32::from(!unlocked));
-            EnableWindow(
-                self.control(DISCONNECT),
-                i32::from(unlocked && !self.children.is_empty()),
-            );
         }
         self.refresh_authentication();
-        terminal_view::attach(
-            self.control(TERMINAL),
-            if unlocked {
-                self.children.first().map(SshSession::input)
-            } else {
-                None
-            },
-            false,
-        );
         self.layout();
     }
 
@@ -855,7 +1121,37 @@ impl State {
         }
     }
 
-    fn refresh_list(&self) {
+    fn position_card_buttons(&self) {
+        let list = self.control(LIST);
+        let s = |v| theme::scale(v, self.theme.dpi);
+        // SAFETY: queries only this list and repositions its owned buttons using list-client coordinates.
+        unsafe {
+            let mut client = RECT::default();
+            GetClientRect(list, &mut client);
+            for index in 0..self.hosts.len() {
+                let mut row = RECT::default();
+                let found = SendMessageW(
+                    list,
+                    LB_GETITEMRECT,
+                    index,
+                    std::ptr::addr_of_mut!(row) as LPARAM,
+                ) != LB_ERR as isize;
+                let top = row.top + s(60);
+                let visible = found && top >= 0 && top + s(28) <= client.bottom;
+                for (offset, x) in [(0, 16), (1, 128)] {
+                    let handle = self.control(CARD_BUTTON_BASE + index * 2 + offset);
+                    if !handle.is_null() {
+                        MoveWindow(handle, s(x), top, s(104), s(28), 0);
+                        ShowWindow(handle, if visible { SW_SHOWNA } else { SW_HIDE });
+                        InvalidateRect(handle, null(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    fn refresh_list(&mut self) -> Result<()> {
+        self.remove_controls(CARD_BUTTON_BASE, SESSION_BUTTON_BASE);
         // SAFETY: listbox is live; LB_ADDSTRING copies each null-terminated string synchronously.
         unsafe {
             SendMessageW(self.control(LIST), LB_RESETCONTENT, 0, 0);
@@ -870,7 +1166,20 @@ impl State {
                 SendMessageW(self.control(LIST), LB_SETCURSEL, index, 0);
             }
         }
+        for index in 0..self.hosts.len() {
+            for (offset, label) in [(0, "Connect"), (1, "Edit")] {
+                self.add(
+                    self.control(LIST),
+                    "BUTTON",
+                    label,
+                    CARD_BUTTON_BASE + index * 2 + offset,
+                    WS_TABSTOP | BS_OWNERDRAW as u32,
+                    [0, 0, 1, 1],
+                )?;
+            }
+        }
         self.layout();
+        Ok(())
     }
 
     fn reset_form(&mut self) {
@@ -885,7 +1194,7 @@ impl State {
             SendMessageW(self.control(AUTHENTICATION), CB_SETCURSEL, 0, 0);
         }
         self.refresh_authentication();
-        self.workspace_labels();
+        self.layout();
     }
 
     fn unlock(&mut self) -> Result<()> {
@@ -925,7 +1234,7 @@ impl State {
                 self.last_activity = Instant::now();
                 self.set(UNLOCK, "Unlock vault");
                 self.refresh_enabled();
-                self.refresh_list();
+                self.refresh_list()?;
                 self.reset_form();
                 self.layout();
                 self.set(
@@ -945,8 +1254,10 @@ impl State {
 
     fn lock(&mut self) {
         self.show_master(false);
-        for child in &mut self.children {
-            child.cancel_pending_credentials();
+        for tab in &mut self.tabs {
+            if let Some(session) = &mut tab.session {
+                session.cancel_pending_credentials();
+            }
         }
         self.vault = None;
         for host in &mut self.hosts {
@@ -964,8 +1275,7 @@ impl State {
             }
         }
         self.hosts.clear();
-        self.active_label = "SSH session".into();
-        self.refresh_list();
+        let _ = self.refresh_list();
         self.reset_form();
         self.set(PORT, "");
         self.set(PASSWORD, "");
@@ -1005,7 +1315,7 @@ impl State {
             );
         }
         self.refresh_authentication();
-        self.workspace_labels();
+        self.layout();
     }
 
     fn save(&mut self) -> Result<()> {
@@ -1051,12 +1361,14 @@ impl State {
         self.hosts = next;
         self.envelope = Some(sealed);
         self.selected = Some(selected);
-        self.refresh_list();
+        self.refresh_list()?;
         self.refresh_authentication();
         self.workspace_labels();
+        self.details = false;
+        self.refresh_enabled();
         self.set(
             STATUS,
-            "Server saved. Select Terminal and connect when ready.",
+            "Server saved. Use Connect on its card to open a session.",
         );
         Ok(())
     }
@@ -1071,7 +1383,7 @@ impl State {
         self.envelope = Some(sealed);
         self.hosts = next;
         self.reset_form();
-        self.refresh_list();
+        self.refresh_list()?;
         self.set(
             STATUS,
             "Server removed from the inventory. Its OpenSSH trust entry is retained.",
@@ -1079,7 +1391,12 @@ impl State {
         Ok(())
     }
 
-    fn connect(&mut self, action: Option<ReadOnlyAction>) -> Result<()> {
+    fn connect(&mut self) -> Result<()> {
+        if self.tabs.len() >= MAX_SESSION_TABS {
+            return Err(
+                "Close a session tab before opening another; up to 16 tabs are supported.".into(),
+            );
+        }
         let vault = self.vault.as_ref().ok_or("Unlock the vault first.")?;
         let host = self
             .hosts
@@ -1100,82 +1417,40 @@ impl State {
         } else {
             None
         };
-        self.disconnect();
-        self.details = false;
-        self.layout();
-        let terminal = self.control(TERMINAL);
-        terminal_view::attach(terminal, None, true);
         let session = super::ssh::connect(
             &self.paths,
             &host,
-            action,
+            None,
             password,
-            terminal_view::size(terminal),
+            terminal_view::size(self.control(TERMINAL)),
         )?;
-        terminal_view::attach(terminal, Some(session.input()), false);
-        self.active_label = format!("{}@{}:{}", host.username, host.address, host.port);
-        self.children.push(session);
-        self.refresh_enabled();
-        // SAFETY: the visible terminal child can receive keyboard focus on this UI thread.
-        unsafe {
-            SetFocus(terminal);
-        }
+        self.open_tab(host.name, Some(session))?;
         self.set(STATUS, "Connecting in the built-in terminal. Verify any new host fingerprint using a trusted source.");
         Ok(())
     }
 
-    fn disconnect(&mut self) {
-        let terminal = self.control(TERMINAL);
-        terminal_view::attach(terminal, None, false);
-        for child in &mut self.children {
-            child.cancel_pending_credentials();
-            for bytes in child.finish_output() {
-                terminal_view::feed(terminal, &bytes);
-            }
-        }
-        self.children.clear();
-        self.active_label.clear();
-        self.refresh_enabled();
-        self.set(
-            STATUS,
-            "Session disconnected. Terminal output remains available until the next connection.",
-        );
-    }
-
     fn confirmation(&self, id: usize) -> Result<Option<String>> {
-        if id == CONNECT && !self.children.is_empty() {
-            return Ok(Some(
-                "Disconnect the current SSH session and connect to the selected server?".into(),
-            ));
+        if (SESSION_BUTTON_BASE..SESSION_BUTTON_BASE + MAX_SESSION_TABS * 2).contains(&id)
+            && !(id - SESSION_BUTTON_BASE).is_multiple_of(2)
+            && let Some(tab) = self
+                .tabs
+                .iter()
+                .find(|tab| tab.slot == (id - SESSION_BUTTON_BASE) / 2)
+            && tab.session.is_some()
+        {
+            return Ok(Some(format!(
+                "Close the {} session tab and disconnect its SSH session?",
+                tab.name
+            )));
         }
-        if id == DELETE || matches!(id, SYSTEM | UPTIME | DISK | MEMORY) {
+        if id == DELETE {
             let host = self
                 .hosts
                 .get(self.selected.ok_or("Select a saved server first.")?)
                 .ok_or("Selected server no longer exists.")?;
-            if id == DELETE {
-                return Ok(Some(format!(
-                    "Delete {} from the local inventory?",
-                    host.name
-                )));
-            }
-            let action = match id {
-                SYSTEM => ReadOnlyAction::System,
-                UPTIME => ReadOnlyAction::Uptime,
-                DISK => ReadOnlyAction::Disk,
-                _ => ReadOnlyAction::Memory,
-            };
             return Ok(Some(format!(
-                "Run this read-only check on {}@{}:{}?\n\n{}\n\nOutput appears in the built-in terminal.{}",
-                host.username,
-                host.address,
-                host.port,
-                action.command(),
-                if self.children.is_empty() {
-                    ""
-                } else {
-                    " The current SSH session will disconnect."
-                }
+                "Delete {} from the local inventory?",
+                host.name
             )));
         }
         Ok(None)
@@ -1192,6 +1467,54 @@ impl State {
             return Ok(());
         }
         if notification != BN_CLICKED as usize {
+            return Ok(());
+        }
+        if let Some((_, _, action)) = SHORTCUT_ACTIONS.iter().find(|(key, _, _)| *key == id) {
+            return self.insert_shortcut(*action);
+        }
+        if (CARD_BUTTON_BASE..SESSION_BUTTON_BASE).contains(&id) {
+            if self.vault.is_none() {
+                return Err("Unlock the vault first.".into());
+            }
+            let index = (id - CARD_BUTTON_BASE) / 2;
+            if index >= self.hosts.len() {
+                return Err("Server no longer exists.".into());
+            }
+            // SAFETY: selects an existing item in this owned list before executing the card action.
+            unsafe {
+                SendMessageW(self.control(LIST), LB_SETCURSEL, index, 0);
+            }
+            self.select();
+            if (id - CARD_BUTTON_BASE).is_multiple_of(2) {
+                return self.connect();
+            }
+            self.details = true;
+            self.layout();
+            // SAFETY: the visible editor belongs to this window.
+            unsafe {
+                SetFocus(self.control(NAME));
+            }
+            return Ok(());
+        }
+        if (SESSION_BUTTON_BASE..SESSION_BUTTON_BASE + MAX_SESSION_TABS * 2).contains(&id) {
+            if self.vault.is_none() {
+                return Err("Unlock the vault first.".into());
+            }
+            let slot = (id - SESSION_BUTTON_BASE) / 2;
+            if !(id - SESSION_BUTTON_BASE).is_multiple_of(2) {
+                return self.close_tab(slot);
+            }
+            if self.tabs.iter().all(|tab| tab.slot != slot) {
+                return Err("Session tab no longer exists.".into());
+            }
+            self.active_tab = Some(slot);
+            self.details = false;
+            self.reveal_active_tab();
+            self.refresh_enabled();
+            // SAFETY: focuses the selected live terminal after laying it out.
+            unsafe {
+                SetFocus(self.active_terminal());
+            }
             return Ok(());
         }
         match id {
@@ -1217,24 +1540,51 @@ impl State {
                 }
                 Ok(())
             }
-            TAB_TERMINAL | TAB_DETAILS if self.vault.is_some() => {
-                self.details = id == TAB_DETAILS;
-                self.layout();
+            CLOSE_EDITOR if self.vault.is_some() => {
+                self.details = false;
+                self.refresh_enabled();
+                // SAFETY: the active terminal is visible and owned by this UI thread.
+                unsafe {
+                    SetFocus(self.active_terminal());
+                }
                 Ok(())
             }
-            DISCONNECT if self.vault.is_some() => {
-                self.disconnect();
+            PREVIOUS_TABS | NEXT_TABS if self.vault.is_some() => {
+                let (start, count, _) = self.tab_range();
+                self.tab_offset = if id == PREVIOUS_TABS {
+                    start.saturating_sub(count)
+                } else {
+                    (start + count).min(self.tabs.len().saturating_sub(count))
+                };
+                self.layout();
                 Ok(())
             }
             SAVE => self.save(),
             DELETE => self.delete(),
-            CONNECT => self.connect(None),
-            SYSTEM => self.connect(Some(ReadOnlyAction::System)),
-            UPTIME => self.connect(Some(ReadOnlyAction::Uptime)),
-            DISK => self.connect(Some(ReadOnlyAction::Disk)),
-            MEMORY => self.connect(Some(ReadOnlyAction::Memory)),
             _ => Ok(()),
         }
+    }
+
+    fn insert_shortcut(&mut self, action: ReadOnlyAction) -> Result<()> {
+        if self.vault.is_none() {
+            return Err("Unlock the vault first.".into());
+        }
+        if self.active().is_none_or(|tab| tab.session.is_none()) {
+            return Err("Connect to a server before using command shortcuts.".into());
+        }
+        self.details = false;
+        self.layout();
+        let terminal = self.active_terminal();
+        terminal_view::insert_command(terminal, action.command())?;
+        // SAFETY: the visible terminal belongs to this window and receives focus on the UI thread.
+        unsafe {
+            SetFocus(terminal);
+        }
+        self.set(
+            STATUS,
+            "Command inserted. Edit it or press Enter in the terminal to run it.",
+        );
+        Ok(())
     }
 
     fn show_master(&self, show: bool) {
@@ -1262,29 +1612,98 @@ impl State {
         if self.vault.is_some() && self.last_activity.elapsed() >= Duration::from_secs(600) {
             self.lock();
         }
-        let terminal = self.control(TERMINAL);
-        let mut exit = None;
-        self.children.retain_mut(|child| {
-            let protocol_input = child.input();
-            for bytes in child.output() {
-                terminal_view::feed_session(terminal, &bytes, &protocol_input);
+        let mut changed = false;
+        let mut active_exit = None;
+        let mut finished = Vec::new();
+        for tab in &mut self.tabs {
+            let Some(session) = &mut tab.session else {
+                continue;
+            };
+            let input = session.input();
+            for bytes in session.output() {
+                terminal_view::feed_session(tab.terminal, &bytes, &input);
             }
-            if let Ok(Some(status)) = child.try_wait() {
-                for bytes in child.finish_output() {
-                    terminal_view::feed(terminal, &bytes);
+            if let Ok(Some(code)) = session.try_wait() {
+                for bytes in session.finish_output() {
+                    terminal_view::feed(tab.terminal, &bytes);
                 }
-                exit = Some(status);
-                false
-            } else {
-                true
+                terminal_view::attach(tab.terminal, None, false);
+                tab.exit_code = Some(code);
+                tab.session = None;
+                finished.push((tab.slot, format!("{} (ended)", tab.name)));
+                changed = true;
+                if self.active_tab == Some(tab.slot) {
+                    active_exit = Some(code);
+                }
             }
-        });
-        if let Some(code) = exit {
-            terminal_view::attach(terminal, None, false);
-            self.active_label.clear();
+        }
+        for (slot, label) in finished {
+            self.set(SESSION_BUTTON_BASE + slot * 2, &label);
+        }
+        if changed {
             self.refresh_enabled();
+        }
+        if let Some(code) = active_exit {
             self.set(STATUS, &if code == 0 { "Session finished. Its output remains in the terminal.".into() } else { format!("OpenSSH exited with code {code}. Check the terminal output and your server's address and login details.") });
         }
+    }
+}
+
+unsafe extern "system" fn server_list_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass: usize,
+    _data: usize,
+) -> LRESULT {
+    if matches!(message, WM_COMMAND | WM_DRAWITEM) {
+        // SAFETY: the native list's child notification is forwarded synchronously to its live parent.
+        return unsafe { SendMessageW(GetParent(window), message, wparam, lparam) };
+    }
+    // SAFETY: forwards the unchanged message to the list's original procedure.
+    let result = unsafe { DefSubclassProc(window, message, wparam, lparam) };
+    if matches!(
+        message,
+        WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN | WM_SIZE | LB_SETTOPINDEX | LB_SETCURSEL
+    ) {
+        // SAFETY: asynchronous positioning carries no pointers and runs after native scrolling finishes.
+        unsafe {
+            PostMessageW(GetParent(window), POSITION_CARDS, 0, 0);
+        }
+    }
+    result
+}
+
+fn shortcuts_menu(window: HWND, button: HWND) -> Result<usize> {
+    // SAFETY: menu is owned by this callback and destroyed after the modal selection returns.
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return Err("Cannot open command shortcuts.".into());
+        }
+        let result = (|| {
+            for (id, label, action) in SHORTCUT_ACTIONS {
+                let label = wide(&format!("{label}\t{}", action.command()));
+                if AppendMenuW(menu, MF_STRING, id, label.as_ptr()) == 0 {
+                    return Err("Cannot create command shortcuts.".into());
+                }
+            }
+            let mut bounds = RECT::default();
+            if GetWindowRect(button, &mut bounds) == 0 {
+                return Err("Cannot position command shortcuts.".into());
+            }
+            Ok(TrackPopupMenuEx(
+                menu,
+                TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTALIGN,
+                bounds.right,
+                bounds.bottom,
+                window,
+                null(),
+            ) as usize)
+        })();
+        DestroyMenu(menu);
+        result
     }
 }
 
@@ -1336,7 +1755,7 @@ unsafe extern "system" fn window_proc(
             let cell = unsafe { &*pointer };
             if message == WM_CLOSE {
                 let active = match cell.try_borrow_mut() {
-                    Ok(state) => !state.children.is_empty(),
+                    Ok(state) => state.tabs.iter().any(|tab| tab.session.is_some()),
                     Err(_) => {
                         // SAFETY: defer teardown until the current state operation has released its borrow.
                         unsafe {
@@ -1348,7 +1767,7 @@ unsafe extern "system" fn window_proc(
                 if active
                     && !confirm(
                         window,
-                        "Close SentinelSSH and disconnect the active SSH session?",
+                        "Close SentinelSSH and disconnect all active SSH sessions?",
                     )
                 {
                     return 0;
@@ -1404,7 +1823,7 @@ unsafe extern "system" fn window_proc(
                                         | SERVER_PASSWORD
                                         | AUTHENTICATION
                                 );
-                            let panel = matches!(id, LIST | LIST_HINT | 205 | 220);
+                            let panel = matches!(id, LIST | LIST_HINT | 205);
                             let colour = if input {
                                 theme::INPUT
                             } else if panel {
@@ -1438,6 +1857,37 @@ unsafe extern "system" fn window_proc(
             // Release the state borrow before modal dialogs so workstation lock/suspend
             // messages can still lock the vault while a confirmation is visible.
             if message == WM_COMMAND && (wparam >> 16) & 0xffff == BN_CLICKED as usize {
+                if wparam & 0xffff == SHORTCUTS {
+                    let button = cell
+                        .try_borrow()
+                        .ok()
+                        .filter(|state| {
+                            state.vault.is_some()
+                                && state.active().is_some_and(|tab| tab.session.is_some())
+                        })
+                        .map(|state| state.control(SHORTCUTS));
+                    if let Some(button) = button {
+                        let choice = shortcuts_menu(window, button);
+                        // SAFETY: a modal menu can dispatch destruction; verify ownership before using state.
+                        if unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } == pointer as isize {
+                            match choice {
+                                Ok(id) if id != 0 => {
+                                    // SAFETY: posts only a command ID; insertion rechecks the vault and active session.
+                                    unsafe {
+                                        PostMessageW(window, WM_COMMAND, id, 0);
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Ok(state) = cell.try_borrow() {
+                                        state.set(STATUS, &error);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    return 0;
+                }
                 let preview = cell
                     .try_borrow()
                     .ok()
@@ -1468,6 +1918,7 @@ unsafe extern "system" fn window_proc(
                 match message {
                     WM_ERASEBKGND => return 1,
                     WM_SIZE => {
+                        state.reveal_active_tab();
                         state.layout();
                         return 0;
                     }
@@ -1501,12 +1952,19 @@ unsafe extern "system" fn window_proc(
                         return 0;
                     }
                     terminal_view::RESIZED => {
-                        if let Some(child) = state.children.first() {
-                            let (columns, rows) = terminal_view::size(state.control(TERMINAL));
-                            if let Err(error) = child.resize(columns, rows) {
+                        if let Some(tab) =
+                            state.tabs.iter().find(|tab| tab.terminal == wparam as HWND)
+                            && let Some(session) = &tab.session
+                        {
+                            let (columns, rows) = terminal_view::size(tab.terminal);
+                            if let Err(error) = session.resize(columns, rows) {
                                 state.set(STATUS, &error);
                             }
                         }
+                        return 0;
+                    }
+                    POSITION_CARDS => {
+                        state.position_card_buttons();
                         return 0;
                     }
                     terminal_view::ACTIVITY => {
@@ -1649,7 +2107,7 @@ pub fn run() -> Result<()> {
             let terminal_focused = !pointer.is_null()
                 && (*pointer)
                     .try_borrow()
-                    .is_ok_and(|state| GetFocus() == state.control(TERMINAL));
+                    .is_ok_and(|state| GetFocus() == state.active_terminal());
             if terminal_focused || IsDialogMessageW(window, &message) == 0 {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -1662,6 +2120,251 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_session() -> SshSession {
+        SshSession::from_test_process(
+            super::super::pty::spawn(
+                &std::env::current_exe().unwrap(),
+                &[
+                    "--exact".into(),
+                    "windows::pty::tests::pseudoconsole_child_fixture".into(),
+                    "--nocapture".into(),
+                ],
+                &std::env::temp_dir(),
+                &[("SENTINEL_PTY_FIXTURE".into(), "echo".into())],
+                100,
+                30,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn fixture_window() -> HWND {
+        let root = std::env::temp_dir().join(format!(
+            "sentinel-session-ui-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        super::super::paths::secure_directory(&root).unwrap();
+        create_window(AppPaths {
+            database_dir: root.join("database"),
+            known_hosts: root.join("known_hosts"),
+            ssh: root.join("no-ssh.exe"),
+            root,
+        })
+        .unwrap()
+    }
+
+    fn wait_for_text(state: &mut State, terminal: HWND, text: &str) {
+        let start = Instant::now();
+        loop {
+            state.tick();
+            if terminal_view::snapshot(terminal).contains(text) {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "Missing {text}: {}",
+                terminal_view::snapshot(terminal)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn session_tabs_keep_output_input_and_close_operations_separate() {
+        const MASTER: &str = "disposable session tab master passphrase";
+        let window = fixture_window();
+        // SAFETY: this test owns its window and state; all terminal messages are sent on its UI thread.
+        unsafe {
+            let cell = &*(GetWindowLongPtrW(window, GWLP_USERDATA) as *const RefCell<State>);
+            {
+                let mut state = cell.borrow_mut();
+                state.set(PASSWORD, MASTER);
+                state.set(CONFIRM, MASTER);
+                state.unlock().unwrap();
+                let first = state
+                    .open_tab("Production".into(), Some(fixture_session()))
+                    .unwrap();
+                let first_terminal = state.active_terminal();
+                let second = state
+                    .open_tab("Staging".into(), Some(fixture_session()))
+                    .unwrap();
+                let second_terminal = state.active_terminal();
+                assert_ne!(first_terminal, second_terminal);
+                assert_eq!(state.tabs.len(), 2);
+                wait_for_text(&mut state, first_terminal, "PTY_READY");
+                wait_for_text(&mut state, second_terminal, "PTY_READY");
+                assert!(terminal_view::insert_command(first_terminal, "wrong-session").is_err());
+                state
+                    .command(SESSION_BUTTON_BASE + first * 2, BN_CLICKED as usize)
+                    .unwrap();
+                state.command(DISK, BN_CLICKED as usize).unwrap();
+                assert!(terminal_view::insert_command(second_terminal, "wrong-session").is_err());
+                state.tick();
+                assert!(
+                    state.tabs.iter().all(|tab| tab
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .try_wait()
+                        .unwrap()
+                        .is_none())
+                );
+                SendMessageW(first_terminal, WM_CHAR, 13, 0);
+                wait_for_text(&mut state, first_terminal, "RESULT:df -h");
+                assert!(!terminal_view::snapshot(second_terminal).contains("df -h"));
+                let start = Instant::now();
+                while state
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.slot == first)
+                    .unwrap()
+                    .session
+                    .is_some()
+                {
+                    state.tick();
+                    assert!(start.elapsed() < Duration::from_secs(10));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(state.tabs.len(), 2);
+                assert!(terminal_view::snapshot(first_terminal).contains("RESULT:df -h"));
+                state.close_tab(first).unwrap();
+                assert_eq!(state.active_tab, Some(second));
+                assert_eq!(IsWindow(first_terminal), 0);
+                state.command(UPTIME, BN_CLICKED as usize).unwrap();
+                state.lock();
+                assert!(state.command(DISK, BN_CLICKED as usize).is_err());
+                assert!(terminal_view::insert_command(second_terminal, "wrong-session").is_err());
+                assert!(
+                    state
+                        .active()
+                        .unwrap()
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .try_wait()
+                        .unwrap()
+                        .is_none()
+                );
+                state.set(PASSWORD, MASTER);
+                state.unlock().unwrap();
+                assert_eq!(state.active_tab, Some(second));
+                let third = state
+                    .open_tab("Temporary".into(), Some(fixture_session()))
+                    .unwrap();
+                let third_terminal = state.active_terminal();
+                assert!(
+                    state
+                        .confirmation(SESSION_BUTTON_BASE + third * 2 + 1)
+                        .unwrap()
+                        .is_some()
+                );
+                state.close_tab(third).unwrap();
+                assert_eq!(IsWindow(third_terminal), 0);
+                assert_eq!(state.active_tab, Some(second));
+                assert_eq!(state.tabs.len(), 1);
+                assert!(
+                    state
+                        .active()
+                        .unwrap()
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .try_wait()
+                        .unwrap()
+                        .is_none()
+                );
+                SendMessageW(second_terminal, WM_CHAR, 13, 0);
+                wait_for_text(&mut state, second_terminal, "RESULT:uptime");
+                assert!(!terminal_view::snapshot(second_terminal).contains("wrong-session"));
+            }
+            DestroyWindow(window);
+        }
+    }
+
+    #[test]
+    fn card_buttons_follow_scrolling_and_session_tabs_remain_reachable() {
+        let window = fixture_window();
+        // SAFETY: test owns this disposable native window and only interacts with its controls.
+        unsafe {
+            let cell = &*(GetWindowLongPtrW(window, GWLP_USERDATA) as *const RefCell<State>);
+            {
+                let mut state = cell.borrow_mut();
+                state.vault = Some(
+                    UnlockedVault::create(&Secret(b"disposable cards vault passphrase".to_vec()))
+                        .unwrap(),
+                );
+                state.hosts = (0..8)
+                    .map(|index| Host {
+                        name: format!("Server {}", index + 1),
+                        address: format!("server-{}.example.test", index + 1),
+                        port: 22,
+                        username: "deploy".into(),
+                        identity_path: String::new(),
+                        authentication: Authentication::Key,
+                        password: None,
+                    })
+                    .collect();
+                state.refresh_list().unwrap();
+                state.refresh_enabled();
+                assert_eq!(state.text(CARD_BUTTON_BASE), "Connect");
+                assert_eq!(state.text(CARD_BUTTON_BASE + 1), "Edit");
+                assert_eq!(
+                    GetWindowLongPtrW(state.control(CARD_BUTTON_BASE + 14), GWL_STYLE) as u32
+                        & WS_VISIBLE,
+                    0
+                );
+                SendMessageW(state.control(LIST), LB_SETTOPINDEX, 7, 0);
+                state.position_card_buttons();
+                assert_ne!(
+                    GetWindowLongPtrW(state.control(CARD_BUTTON_BASE + 14), GWL_STYLE) as u32
+                        & WS_VISIBLE,
+                    0
+                );
+                assert_eq!(
+                    GetWindowLongPtrW(state.control(CARD_BUTTON_BASE), GWL_STYLE) as u32
+                        & WS_VISIBLE,
+                    0
+                );
+            }
+            // Exercise the actual list-to-parent forwarding used by the card's native Edit button.
+            let list = cell.borrow().control(LIST);
+            let edit = cell.borrow().control(CARD_BUTTON_BASE + 15);
+            SendMessageW(list, WM_COMMAND, CARD_BUTTON_BASE + 15, edit as LPARAM);
+            {
+                let mut state = cell.borrow_mut();
+                assert_eq!(state.selected, Some(7));
+                assert_eq!(state.text(NAME), "Server 8");
+                assert!(state.details);
+                for index in 0..8 {
+                    state
+                        .open_tab(format!("Session {}", index + 1), None)
+                        .unwrap();
+                }
+                let (start, count, overflow) = state.tab_range();
+                assert!(overflow);
+                assert!(start <= 7 && start + count > 7);
+                state.command(PREVIOUS_TABS, BN_CLICKED as usize).unwrap();
+                assert!(state.tab_range().0 < start);
+                state
+                    .command(SESSION_BUTTON_BASE, BN_CLICKED as usize)
+                    .unwrap();
+                assert_eq!(state.active_tab, Some(0));
+                assert_eq!(state.tab_range().0, 0);
+                state
+                    .command(CARD_BUTTON_BASE, BN_CLICKED as usize)
+                    .unwrap_err();
+                assert_eq!(state.tabs.len(), 8);
+                assert_eq!(state.active_tab, Some(0));
+            }
+            preview(window, "session-tabs-and-server-cards");
+            DestroyWindow(window);
+        }
+    }
 
     fn preview(window: HWND, name: &str) {
         let Some(directory) = std::env::var_os("SENTINEL_UI_PREVIEW_DIR") else {
@@ -1792,14 +2495,37 @@ mod tests {
                 state.save().unwrap();
                 assert_eq!(state.hosts.len(), 1);
                 assert_eq!(state.hosts[0].authentication, Authentication::Key);
+                assert!(state.control(SYSTEM).is_null());
+                assert!(state.control(UPTIME).is_null());
+                assert!(state.control(DISK).is_null());
+                assert!(state.control(MEMORY).is_null());
+                assert_eq!(state.text(NEW), "New server");
+                assert_eq!(
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(
+                        state.control(SHORTCUTS)
+                    ),
+                    0
+                );
+                assert_eq!(state.confirmation(DISK).unwrap(), None);
+                assert!(state.command(DISK, BN_CLICKED as usize).is_err());
+                assert!(state.tabs.is_empty());
+                assert_eq!(state.selected, Some(0));
                 state.details = true;
                 state.layout();
+                assert_ne!(
+                    GetWindowLongPtrW(state.control(DELETE), GWL_STYLE) as u32 & WS_VISIBLE,
+                    0
+                );
             }
             preview(window, "server-details");
             {
                 let mut state = cell.borrow_mut();
                 state.details = false;
                 state.layout();
+                assert_eq!(
+                    GetWindowLongPtrW(state.control(DELETE), GWL_STYLE) as u32 & WS_VISIBLE,
+                    0
+                );
                 terminal_view::feed(state.control(TERMINAL), b"\x1b[38;2;126;231;135mdeploy@demo:~$\x1b[0m uname -a\r\nLinux demo 6.8.0 x86_64 GNU/Linux\r\n\r\n\x1b[38;2;126;231;135mdeploy@demo:~$\x1b[0m df -h /\r\nFilesystem      Size  Used Avail Use% Mounted on\r\n/dev/vda1        80G   12G   68G  15% /\r\n\r\n\x1b[38;2;126;231;135mdeploy@demo:~$\x1b[0m ");
             }
             preview(window, "terminal-workspace");

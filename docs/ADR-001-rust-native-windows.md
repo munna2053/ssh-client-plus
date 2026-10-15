@@ -1,6 +1,6 @@
 # ADR 001: Rust with native Windows services
 
-Status: accepted by the project owner. Updated: 10 October 2026.
+Status: accepted by the project owner; the UI choice and framework restriction are superseded by [ADR 002](ADR-002-slint-windows-frontend.md). Updated: 13 October 2026.
 
 ## Decision
 
@@ -38,7 +38,7 @@ Saved-password connections select password authentication, disable public-key an
 
 The [ConPTY lifecycle](https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session) provides process hosting, while `src/terminal.rs` interprets bounded common VT sequences and `terminal_view.rs` draws the cells with GDI. Grid, history, control-string parsing, clipboard paste, and worker queues have explicit limits. Remote OSC/DCS strings cannot write files, alter the clipboard, change the window title, or launch processes. Only an explicit local copy/paste gesture accesses the clipboard. The renderer does not implement full xterm semantics, advanced mouse/graphics protocols, complete Unicode shaping, or scrollback reflow.
 
-One session is active at a time; replacement requires confirmation. Disconnect and app closure tear down OpenSSH and the pseudoconsole while preserving bounded final output for display. Vault locking cancels pending credentials and hides/detaches user input from the terminal; an already authenticated session keeps running and its terminal/history remain in memory. Unlock reattaches user input. External key/agent lifetimes remain separate.
+Each SSH session has its own terminal window, bounded history, and session tab, with up to 16 tabs open. Server-card Connect buttons open new tabs without replacing existing sessions; Edit opens the server editor. Switching tabs changes local input focus while output and terminal protocol replies continue for every session. Shortcuts insert a single command line into the selected terminal without Enter. Completed sessions retain their output until their tab closes. Closing a running tab requires confirmation and tears down only its OpenSSH process and pseudoconsole; app closure confirms before ending all running sessions. Vault locking cancels pending credentials and hides all tabs/terminals while detaching local input; authenticated sessions keep running and their terminal/history remain in memory. Unlock reattaches input to the selected tab. External key/agent lifetimes remain separate.
 
 ## Consequences
 

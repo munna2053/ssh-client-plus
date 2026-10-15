@@ -2,11 +2,13 @@
 
 **Document status:** Rust architecture selected; first native preview implemented; full MVP gates remain open<br>
 **Prepared:** 8 October 2026  
-**Revised:** 10 October 2026<br>
+**Revised:** 13 October 2026<br>
 **Target v1 client:** Windows 11 (Windows 10 only after compatibility validation)  
 **Target v1 managed hosts:** Linux servers over SSH  
 **Later clients:** macOS, then Linux  
 **Working product name:** SentinelSSH (placeholder; trademark/domain availability not checked)
+
+**Owner amendment, 13 October 2026:** the Windows frontend now uses Slint, approved as an exception to the earlier application-framework restriction. Windows remains the only current client target. The existing Windows vault, storage, OpenSSH, ConPTY, and native terminal renderer remain in use. [ADR 002](docs/ADR-002-slint-windows-frontend.md) supersedes this plan's earlier Win32 UI selection and no-framework statements.
 
 ---
 

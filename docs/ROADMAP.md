@@ -1,6 +1,6 @@
 # Rust implementation checklist
 
-Updated: 10 October 2026. The full scope remains in [the engineering plan](../secure_ssh_server_manager_project_plan.md).
+Updated: 13 October 2026. The full scope remains in [the engineering plan](../secure_ssh_server_manager_project_plan.md).
 
 ## Implemented preview
 
@@ -13,9 +13,11 @@ Updated: 10 October 2026. The full scope remains in [the engineering plan](../se
 - [x] Dedicated host trust file, first-use confirmation, key/agent login, and disabled forwarding.
 - [x] Saved-password login with separate vault-key encryption, on-demand decryption, and single-use private askpass handoff.
 - [x] Legacy inventory upgrade, encrypted-password edit/reopen tests, helper delivery/cancellation and caller validation.
-- [x] System/uptime/disk/memory checks with target/command confirmation and embedded terminal output.
+- [x] System/uptime/disk/memory shortcuts dropdown that inserts commands into the active terminal for editing and explicit Enter to run.
 - [x] Wrong-password, tamper, invalid-input, native UI, encrypted-artifact, and crash-recovery tests.
-- [x] Dark resizable workspace, server sidebar, and separate server details.
+- [x] Dark resizable workspace, server-card Connect/Edit controls, and a separate server editor.
+- [x] Slint Windows frontend with hover/press/focus animations, native terminal hosting, dark scrollbars, and disposable UI preview/smoke tests.
+- [x] Independent SSH session tabs, per-session terminal/history, tab paging/closing, and active-tab shortcut routing.
 - [x] ConPTY terminal with common VT rendering, keyboard, colours, copy/paste, resize, bounded history, and explicit disconnect.
 - [x] Console-attachment/input/resize/final-output/cleanup tests and hostile-output parser tests.
 - [x] Local GNU/LLVM release build; inspect imported DLLs.
@@ -34,7 +36,8 @@ Updated: 10 October 2026. The full scope remains in [the engineering plan](../se
 
 - [ ] Portable authenticated encrypted backup/restore and recovery tests.
 - [ ] Passphrase change, schema/KDF upgrades, and account/device migration.
-- [ ] Import/generate keys, inspect public fingerprints, associate identities, rotate, export.
+- [x] Generate Ed25519 OpenSSH key pairs from the server editor, save private files with per-user ACLs, and display/copy the public key. Optional passphrases encrypt generated files; the vault stores the identity path.
+- [ ] Import keys into the encrypted vault, inspect public fingerprints, rotate, export.
 - [ ] Define agent lifetime/signing revocation behavior on lock.
 - [ ] Host tags, environments, search, favorites, and connection/session UI.
 - [ ] Host-key inspection and explicit replacement workflow.
@@ -42,7 +45,7 @@ Updated: 10 October 2026. The full scope remains in [the engineering plan](../se
 
 ## Later staged features
 
-- [ ] Independent terminal renderer review, advanced terminal compatibility, mouse reporting, and multiple sessions.
+- [ ] Independent terminal renderer review, advanced terminal compatibility, and mouse reporting.
 - [ ] Package/service adapters and guarded administrative actions.
 - [ ] SFTP browse/open/save with conflict checks, backups, and permission preservation.
 - [ ] RichEdit remote-text editor and diff workflow.

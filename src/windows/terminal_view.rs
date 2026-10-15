@@ -105,7 +105,7 @@ impl View {
             self.selection = None;
             // SAFETY: posts a signal with no pointers; the parent queries this view's bounded dimensions.
             unsafe {
-                PostMessageW(GetParent(window), RESIZED, 0, 0);
+                PostMessageW(GetParent(window), RESIZED, window as WPARAM, 0);
             }
         }
     }
@@ -197,7 +197,7 @@ impl View {
                         right: bounds.right - pad,
                         bottom: middle + theme::scale(84, self.dpi),
                     },
-                    "Choose a saved server and connect to start a session.",
+                    "Use Connect on a server card to open a session tab.",
                     self.body.0,
                     theme::MUTED,
                     DT_CENTER | DT_SINGLELINE | DT_VCENTER,
@@ -387,6 +387,14 @@ pub(crate) fn size(window: HWND) -> (usize, usize) {
         })
         .unwrap_or((80, 24))
 }
+
+#[cfg(test)]
+pub(crate) fn snapshot(window: HWND) -> String {
+    let view = cell(window).unwrap().borrow();
+    view.model
+        .selection((0, 0), (view.model.rows - 1, view.model.columns - 1), 0)
+}
+
 pub(crate) fn attach(window: HWND, input: Option<SyncSender<Secret>>, reset: bool) {
     if let Some(cell) = cell(window)
         && let Ok(mut view) = cell.try_borrow_mut()
@@ -404,6 +412,37 @@ pub(crate) fn attach(window: HWND, input: Option<SyncSender<Secret>>, reset: boo
         InvalidateRect(window, null(), 0);
     }
 }
+
+pub(crate) fn insert_command(window: HWND, command: &str) -> Result<()> {
+    if command.is_empty() || command.len() > 2048 || command.chars().any(char::is_control) {
+        return Err("Command shortcuts require a single line without control characters.".into());
+    }
+    let cell = cell(window).ok_or("The terminal is unavailable.")?;
+    let mut view = cell
+        .try_borrow_mut()
+        .map_err(|_| "The terminal is busy. Try again.")?;
+    let input = view
+        .input
+        .as_ref()
+        .ok_or("Connect to a server before using command shortcuts.")?;
+    let bytes = if view.model.bracketed_paste {
+        format!("\x1b[200~{command}\x1b[201~").into_bytes()
+    } else {
+        command.as_bytes().to_vec()
+    };
+    input
+        .try_send(Secret(bytes))
+        .map_err(|_| "The terminal cannot accept input right now. Try again.")?;
+    view.scroll = 0;
+    view.selection = None;
+    // SAFETY: these asynchronous messages carry no pointers and target this live terminal and parent.
+    unsafe {
+        PostMessageW(GetParent(window), ACTIVITY, 0, 0);
+        InvalidateRect(window, null(), 0);
+    }
+    Ok(())
+}
+
 pub(crate) fn feed(window: HWND, bytes: &[u8]) {
     update(window, bytes, None);
 }
@@ -709,7 +748,7 @@ fn clipboard_text(window: HWND) -> Result<Secret> {
         Ok(text)
     }
 }
-fn set_clipboard_text(window: HWND, text: &str) -> Result<()> {
+pub(crate) fn set_clipboard_text(window: HWND, text: &str) -> Result<()> {
     let text = wide(text);
     // SAFETY: clipboard opened on its owning UI thread and closed by the guard.
     if unsafe { OpenClipboard(window) } == 0 {
@@ -786,6 +825,56 @@ mod tests {
             DestroyWindow(parent);
         }
     }
+    #[test]
+    fn command_shortcuts_insert_without_enter_and_reject_unavailable_input() {
+        // SAFETY: this test owns a disposable parent and terminal on the current thread.
+        unsafe {
+            let parent = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("").as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                900,
+                600,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!parent.is_null());
+            let terminal = create(parent, 1).unwrap();
+            let (input, receiver) = std::sync::mpsc::sync_channel(1);
+            attach(terminal, Some(input), false);
+            for action in [
+                crate::core::ReadOnlyAction::System,
+                crate::core::ReadOnlyAction::Uptime,
+                crate::core::ReadOnlyAction::Disk,
+                crate::core::ReadOnlyAction::Memory,
+            ] {
+                insert_command(terminal, action.command()).unwrap();
+                assert_eq!(receiver.recv().unwrap().0, action.command().as_bytes());
+                assert!(receiver.try_recv().is_err());
+            }
+            for command in ["", "uptime\r", "uptime\n", "uptime\0", "\x1b[13~"] {
+                assert!(insert_command(terminal, command).is_err());
+                assert!(receiver.try_recv().is_err());
+            }
+            feed(terminal, b"\x1b[?2004h");
+            insert_command(terminal, "df -h").unwrap();
+            assert_eq!(receiver.recv().unwrap().0, b"\x1b[200~df -h\x1b[201~");
+            insert_command(terminal, "uptime").unwrap();
+            assert!(insert_command(terminal, "free -h").is_err());
+            assert_eq!(receiver.recv().unwrap().0, b"\x1b[200~uptime\x1b[201~");
+            assert!(receiver.try_recv().is_err());
+            attach(terminal, None, false);
+            assert!(insert_command(terminal, "df -h").is_err());
+            assert!(receiver.try_recv().is_err());
+            DestroyWindow(parent);
+        }
+    }
+
     #[test]
     fn navigation_keys_support_normal_application_and_modifier_modes() {
         assert_eq!(

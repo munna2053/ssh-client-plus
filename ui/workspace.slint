@@ -1,0 +1,303 @@
+import { ScrollView, AboutSlint, Palette, CheckBox } from "std-widgets.slint";
+import { Colors, ActionButton, Field } from "components.slint";
+
+export struct ServerRow { name: string, destination: string, password-login: bool }
+export struct SessionRow { name: string, running: bool }
+
+export component Workspace inherits Window {
+    title: "SentinelSSH";
+    preferred-width: 1260px; preferred-height: 850px;
+    min-width: 960px; min-height: 600px;
+    background: Colors.canvas;
+    default-font-family: "Segoe UI";
+    default-font-size: 14px;
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    in property <[ServerRow]> servers;
+    in property <[SessionRow]> sessions;
+    in property <bool> unlocked;
+    in property <bool> creating;
+    in property <bool> editor-open;
+    in property <int> selected-server: -1;
+    in property <int> active-session: -1;
+    in property <string> status;
+    in property <bool> active-running;
+    in property <bool> saved-password;
+    in-out property <string> master;
+    in-out property <string> confirmation;
+    in-out property <bool> show-master: false;
+    in-out property <string> server-name;
+    in-out property <string> address;
+    in-out property <string> port: "22";
+    in-out property <string> username;
+    in-out property <string> identity;
+    in-out property <string> public-key;
+    in-out property <string> key-passphrase;
+    in-out property <string> key-confirmation;
+    in-out property <bool> keygen-open: false;
+    in property <bool> generating-key: false;
+    in-out property <string> server-password;
+    in-out property <bool> password-login: false;
+    in-out property <bool> shortcuts-open: false;
+    in property <image> terminal-image;
+    private property <bool> about-open: false;
+    in-out property <bool> close-confirmation-open: false;
+    in property <string> closing-session-name;
+    in-out property <bool> skip-close-confirmation: false;
+    out property <length> terminal-x: 348px;
+    out property <length> terminal-y: 154px;
+    out property <length> terminal-width: root.width - 372px;
+    out property <length> terminal-height: root.height - 224px;
+    out property <bool> terminal-visible: root.unlocked && !root.editor-open && !root.about-open && !root.shortcuts-open && !root.close-confirmation-open;
+    callback unlock;
+    callback lock;
+    callback new-server;
+    callback edit-server(int);
+    callback connect-server(int);
+    callback save-server;
+    callback generate-key;
+    callback copy-public-key;
+    callback delete-server;
+    callback close-editor;
+    callback select-session(int);
+    callback close-session(int);
+    callback finish-close-session(bool);
+    callback show-close-confirmation;
+    callback hide-close-confirmation;
+    show-close-confirmation => { root.close-confirmation-open = true; close-dialog.show(); }
+    hide-close-confirmation => { close-dialog.close(); root.close-confirmation-open = false; }
+    callback insert-shortcut(int);
+    callback open-shortcuts;
+    callback close-shortcuts;
+    callback activity;
+
+    Rectangle {
+        x: 24px; y: 22px; width: 40px; height: 40px;
+        border-radius: 12px; background: Colors.accent;
+        Text { text: ">_"; color: #161125; font-size: 20px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+    }
+    Text { x: 78px; y: 17px; height: 32px; text: "SentinelSSH"; font-size: 24px; font-weight: 700; color: Colors.text; }
+    Text { x: 78px; y: 51px; text: "Your private server workspace"; font-size: 12px; color: Colors.muted; }
+    Text { x: root.width - 365px; y: 34px; text: root.unlocked ? "●  Vault unlocked" : "●  Vault locked"; color: root.unlocked ? Colors.green : Colors.muted; font-size: 12px; }
+    ActionButton { x: root.width - 180px; y: 25px; width: 156px; text: "Lock vault"; enabled: root.unlocked; clicked => { root.lock(); } }
+
+    Rectangle {
+        x: 24px; y: 94px; width: 300px; height: root.height - 146px;
+        background: Colors.panel; border-radius: 14px;
+        border-width: 1px; border-color: #202b3c;
+        Text { x: 18px; y: 19px; text: "SERVERS"; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: Colors.muted; }
+        Text { x: parent.width - 46px; y: 19px; text: root.servers.length; color: Colors.muted; font-size: 11px; }
+        if !root.unlocked || root.servers.length == 0 : Text {
+            x: 18px; y: 67px; width: parent.width - 36px; wrap: word-wrap;
+            text: !root.unlocked ? "Unlock your vault to see your servers." : "Your workspace is ready.\nAdd your first server below.";
+            color: Colors.muted; font-size: 13px;
+        }
+        if root.unlocked : ScrollView {
+            x: 12px; y: 49px; width: parent.width - 24px; height: parent.height - 117px;
+            viewport-width: self.width;
+            viewport-height: max(self.height, root.servers.length * 116px);
+            for server[index] in root.servers : Rectangle {
+                y: index * 116px; height: 106px; width: parent.width - 8px;
+                border-radius: 10px;
+                background: index == root.selected-server ? #25324b : card-touch.has-hover ? #202c41 : Colors.surface;
+                border-width: 1px; border-color: index == root.selected-server ? #736396 : card-touch.has-hover ? #425371 : Colors.border;
+                animate background, border-color { duration: 160ms; easing: ease-out; }
+                card-touch := TouchArea { }
+                Text { x: 14px; y: 11px; width: parent.width - 28px; height: 21px; text: server.name; color: Colors.text; font-size: 14px; font-weight: 600; overflow: elide; }
+                Text { x: 14px; y: 37px; width: parent.width - 28px; height: 19px; text: server.destination; color: Colors.muted; font-size: 12px; overflow: elide; }
+                HorizontalLayout {
+                    x: 12px; y: 65px; width: parent.width - 24px; height: 30px; spacing: 8px;
+                    ActionButton { height: 30px; text: "Connect"; primary: true; clicked => { root.connect-server(index); } }
+                    ActionButton { height: 30px; text: "Edit"; clicked => { root.edit-server(index); } }
+                }
+            }
+        }
+        ActionButton { x: 14px; y: parent.height - 52px; width: parent.width - 28px; height: 38px; text: "+   New server"; enabled: root.unlocked; clicked => { root.new-server(); } }
+    }
+
+    if root.unlocked : Rectangle {
+        x: 348px; y: 94px; width: root.width - 372px; height: 42px; background: transparent;
+        ScrollView {
+            x: 0px; y: 0px;
+            width: parent.width - 168px; height: 48px;
+            viewport-height: 40px;
+            viewport-width: max(self.width, root.sessions.length * 186px);
+            for session[index] in root.sessions : Rectangle {
+                x: index * 186px; y: 0px; width: 178px; height: 40px;
+                background: root.active-session == index && !root.editor-open ? #2b3550 : tab-touch.has-hover ? #202d43 : Colors.panel;
+                border-radius: 9px;
+                border-width: 1px; border-color: root.active-session == index && !root.editor-open ? #756592 : Colors.border;
+                animate background, border-color { duration: 150ms; }
+                tab-touch := TouchArea { mouse-cursor: pointer; clicked => { root.select-session(index); } }
+                Rectangle { x: 12px; y: 17px; width: 6px; height: 6px; border-radius: 3px; background: session.running ? Colors.green : Colors.muted; }
+                Text { x: 26px; width: parent.width - 61px; height: parent.height; text: session.name; color: Colors.text; overflow: elide; vertical-alignment: center; font-size: 13px; }
+                ActionButton { x: parent.width - 31px; y: 5px; width: 26px; height: 30px; text: "×"; clicked => { root.close-session(index); } }
+            }
+        }
+        ActionButton {
+            x: parent.width - 150px; y: 2px; width: 150px; text: "Shortcuts   ▾";
+            enabled: root.active-running;
+            clicked => { if root.shortcuts-open { root.close-shortcuts(); } else { root.open-shortcuts(); } }
+        }
+    }
+
+    if root.unlocked && !root.editor-open && !root.about-open : Rectangle {
+        x: root.terminal-x - 1px; y: root.terminal-y - 1px;
+        width: root.terminal-width + 2px; height: root.terminal-height + 2px;
+        background: #0b1018; border-width: 1px; border-color: Colors.border; border-radius: 10px;
+        if root.shortcuts-open : Image { source: root.terminal-image; x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; image-fit: fill; }
+    }
+    if root.terminal-visible : Text {
+        x: 348px; y: root.height - 55px; color: Colors.muted; font-size: 11px;
+        text: "Ctrl+Shift+C  Copy     Ctrl+Shift+V  Paste     Scroll for history";
+    }
+
+    if !root.unlocked : Rectangle {
+        x: 348px + (root.terminal-width - self.width) / 2;
+        y: max(115px, (root.height - self.height) / 2);
+        width: min(480px, root.terminal-width - 32px);
+        height: root.creating ? 420px : 340px;
+        background: transparent;
+        VerticalLayout {
+            spacing: 16px;
+            Text { text: root.creating ? "Create your private vault" : "Welcome back"; color: Colors.text; font-size: 26px; font-weight: 700; }
+            Text { text: root.creating ? "One passphrase protects your servers and credentials." : "Unlock your vault to return to your workspace."; wrap: word-wrap; color: Colors.muted; font-size: 13px; }
+            Field { label: "Master passphrase"; secret: !root.show-master; text <=> root.master; accepted => { root.unlock(); } }
+            if root.creating : Field { label: "Confirm passphrase"; secret: !root.show-master; text <=> root.confirmation; accepted => { root.unlock(); } }
+            ActionButton { text: root.show-master ? "Hide passphrase" : "Show passphrase"; clicked => { root.show-master = !root.show-master; root.activity(); } }
+            ActionButton { text: root.creating ? "Create vault" : "Unlock vault"; primary: true; clicked => { root.unlock(); } }
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+
+    if root.unlocked && root.editor-open : Rectangle {
+        x: 348px; y: 154px; width: root.terminal-width; height: root.terminal-height;
+        background: transparent;
+        ScrollView {
+            viewport-width: self.width;
+            VerticalLayout {
+                x: 0px; y: 0px;
+                width: min(parent.width - 16px, 740px); spacing: 14px;
+                HorizontalLayout {
+                    Text { text: root.selected-server < 0 ? "New server" : "Edit server"; color: Colors.text; font-size: 22px; font-weight: 700; }
+                    ActionButton { width: 100px; text: "Done"; clicked => { root.close-editor(); } }
+                }
+                Field { label: "Display name"; placeholder: "e.g. Production"; text <=> root.server-name; }
+                HorizontalLayout {
+                    spacing: 14px;
+                    Field { label: "Hostname / IP"; placeholder: "server.example.com"; text <=> root.address; }
+                    Field { width: 110px; label: "SSH port"; text <=> root.port; }
+                }
+                Field { label: "Username"; placeholder: "deploy"; text <=> root.username; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    ActionButton { text: "SSH key / agent"; primary: !root.password-login; clicked => { root.password-login = false; root.server-password = ""; root.activity(); } }
+                    ActionButton { text: "Saved password"; primary: root.password-login; enabled: !root.generating-key; clicked => { root.password-login = true; root.keygen-open = false; root.key-passphrase = ""; root.key-confirmation = ""; root.activity(); } }
+                }
+                if !root.password-login : Field {
+                    label: "Private key file path"; placeholder: "Leave blank to use your Windows SSH agent";
+                    text <=> root.identity; enabled: !root.generating-key;
+                    edited => { root.public-key = ""; }
+                }
+                if !root.password-login && !root.keygen-open : ActionButton {
+                    width: 170px; text: "Create SSH key pair";
+                    clicked => { root.keygen-open = true; root.activity(); }
+                }
+                if !root.password-login && root.keygen-open : VerticalLayout {
+                    spacing: 12px;
+                    Text { text: "Create an Ed25519 key pair"; color: Colors.text; font-weight: 600; }
+                    HorizontalLayout {
+                        spacing: 14px;
+                        Field { label: "Key passphrase (optional)"; secret: true; text <=> root.key-passphrase; enabled: !root.generating-key; }
+                        Field { label: "Confirm key passphrase"; secret: true; text <=> root.key-confirmation; enabled: !root.generating-key; }
+                    }
+                    Text { text: "Saved on this PC with access restricted to your Windows account. A passphrase also encrypts the private key."; wrap: word-wrap; color: Colors.muted; font-size: 12px; }
+                    HorizontalLayout {
+                        spacing: 12px; alignment: start;
+                        ActionButton { width: 180px; text: root.generating-key ? "Generating key…" : "Generate key pair"; primary: true; enabled: !root.generating-key; clicked => { root.generate-key(); } }
+                        ActionButton { width: 100px; text: "Cancel"; enabled: !root.generating-key; clicked => { root.keygen-open = false; root.key-passphrase = ""; root.key-confirmation = ""; } }
+                    }
+                }
+                if !root.password-login && root.public-key != "" : VerticalLayout {
+                    spacing: 10px;
+                    HorizontalLayout {
+                        Text { text: "Public key"; color: Colors.text; font-weight: 600; vertical-alignment: center; }
+                        ActionButton { width: 140px; text: "Copy public key"; clicked => { root.copy-public-key(); } }
+                    }
+                    Rectangle {
+                        height: 86px; background: Colors.surface; border-radius: 8px;
+                        Text { x: 12px; y: 10px; width: parent.width - 24px; height: parent.height - 20px; text: root.public-key; font-family: "Consolas"; font-size: 12px; color: Colors.text; wrap: char-wrap; }
+                    }
+                    Text { text: "Add this public key to ~/.ssh/authorized_keys on your server."; wrap: word-wrap; color: Colors.muted; font-size: 12px; }
+                }
+                if root.password-login : Field { label: "Server password"; placeholder: root.saved-password ? "Leave blank to keep the saved password" : "Enter server password"; secret: true; text <=> root.server-password; }
+                Text { text: root.password-login ? "Passwords are encrypted in your vault and decrypted only for login." : "Use a passphrase-protected OpenSSH key. A blank path uses your SSH agent."; wrap: word-wrap; color: Colors.muted; font-size: 12px; }
+                HorizontalLayout {
+                    spacing: 12px; alignment: start;
+                    ActionButton { width: 150px; text: "Save server"; primary: true; enabled: !root.generating-key; clicked => { root.save-server(); } }
+                    if root.selected-server >= 0 : ActionButton { width: 100px; text: "Delete"; clicked => { root.delete-server(); } }
+                }
+            }
+        }
+    }
+
+    if root.shortcuts-open : TouchArea { clicked => { root.close-shortcuts(); } }
+    if root.shortcuts-open && root.unlocked && root.active-running : Rectangle {
+        x: root.width - 214px; y: 139px; width: 190px; height: 174px;
+        background: Colors.panel; border-width: 1px; border-color: Colors.border; border-radius: 10px;
+        VerticalLayout {
+            padding: 10px; spacing: 5px;
+            ActionButton { text: "System info"; clicked => { root.close-shortcuts(); root.insert-shortcut(0); } }
+            ActionButton { text: "Uptime"; clicked => { root.close-shortcuts(); root.insert-shortcut(1); } }
+            ActionButton { text: "Disk usage"; clicked => { root.close-shortcuts(); root.insert-shortcut(2); } }
+            ActionButton { text: "Memory"; clicked => { root.close-shortcuts(); root.insert-shortcut(3); } }
+        }
+    }
+
+    Rectangle { x: 24px; y: root.height - 34px; height: 1px; width: root.width - 48px; background: #202b3c; }
+    Text { x: 24px; y: root.height - 26px; width: root.width - 132px; text: root.status; color: Colors.muted; font-size: 11px; overflow: elide; }
+    ActionButton { x: root.width - 89px; y: root.height - 29px; width: 65px; height: 24px; text: "About"; clicked => { root.about-open = !root.about-open; root.activity(); } }
+    if root.about-open : Rectangle {
+        x: 348px; y: 154px; width: root.terminal-width; height: root.terminal-height;
+        background: Colors.canvas;
+        VerticalLayout {
+            padding: 30px; spacing: 20px;
+            Text { text: "SentinelSSH"; color: Colors.text; font-size: 28px; font-weight: 700; }
+            Text { text: "A private Windows workspace for your SSH servers."; color: Colors.muted; }
+            AboutSlint { }
+            ActionButton { width: 130px; text: "Back"; clicked => { root.about-open = false; } }
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+
+    if root.close-confirmation-open : Rectangle { background: #00000088; }
+    close-dialog := PopupWindow {
+        x: (root.width - self.width) / 2; y: (root.height - self.height) / 2;
+        width: 500px; height: 242px;
+        close-policy: PopupClosePolicy.no-auto-close;
+        FocusScope {
+            key-pressed(event) => {
+                if event.text == Key.Escape { root.finish-close-session(false); return accept; }
+                return reject;
+            }
+            Rectangle {
+                background: Colors.panel; border-radius: 14px;
+                border-width: 1px; border-color: Colors.border;
+                init => { no-button.take-focus(); }
+                VerticalLayout {
+                    padding: 24px; spacing: 16px;
+                    Text { text: "Close session?"; color: Colors.text; font-size: 21px; font-weight: 600; }
+                    Text {
+                        text: "Close the " + root.closing-session-name + " tab and disconnect its SSH session?";
+                        color: Colors.muted; wrap: word-wrap;
+                    }
+                    CheckBox { text: "Do not show this again"; checked <=> root.skip-close-confirmation; }
+                    HorizontalLayout {
+                        alignment: end; spacing: 12px;
+                        ActionButton { width: 100px; text: "Yes"; primary: true; clicked => { root.finish-close-session(true); } }
+                        no-button := ActionButton { width: 100px; text: "No"; clicked => { root.finish-close-session(false); } }
+                    }
+                }
+            }
+        }
+    }
+}

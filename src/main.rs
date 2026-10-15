@@ -8,7 +8,11 @@ fn main() {
     }
 
     #[cfg(windows)]
-    if let Err(error) = sentinel_ssh::windows::ui::run() {
+    if let Err(error) = sentinel_ssh::windows::slint_frontend::run() {
+        if std::env::args().any(|argument| argument == "--ui-smoke-test") {
+            eprintln!("Slint UI smoke test failed: {error}");
+            std::process::exit(1);
+        }
         sentinel_ssh::windows::ui::show_error(&error);
     }
 

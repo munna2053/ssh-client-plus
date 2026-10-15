@@ -1,8 +1,10 @@
 pub mod askpass;
 pub mod crypto;
+pub(crate) mod keygen;
 pub mod paths;
 pub mod process;
 pub mod pty;
+pub mod slint_frontend;
 pub mod ssh;
 pub mod storage;
 pub mod terminal_view;

@@ -1,0 +1,29 @@
+# ADR 002: Slint frontend for Windows
+
+Status: accepted by the project owner. Updated: 13 October 2026.
+
+The owner authorized replacing the hand-painted Win32 workspace with Slint after reviewing the limits of its visual styling and animation. This supersedes ADR 001's UI-framework restriction. The current release target remains Windows.
+
+Slint 1.13.1 is pinned because it supports the existing Rust 1.90 toolchain. The frontend uses the Winit backend, the software renderer, system fonts, and accessibility support. UI source lives in `ui/workspace.slint` and `ui/components.slint`; `src/windows/slint_frontend.rs` connects its callbacks to the existing Windows services.
+
+Buttons animate hover, press, disabled, and keyboard-focus states. The workspace retains server-card Connect/Edit actions, independent session tabs, a server editor, and command shortcuts that insert text without Enter. Slint owns the layout, vault fields, editor, dropdown, and session controls. The existing GDI terminal remains a native child of the Slint window, preserving its keyboard input, copy/paste, selection, resize, bounded history, and VT parsing. The window handle is obtained after Winit starts its event loop. Terminal bounds track Slint's logical layout and the actual Windows DPI.
+
+The Windows SSH, ConPTY, CNG, DPAPI, ESE, vault format, and credential broker remain in use. Slint callbacks clear password fields after consuming them and never populate a server field with its decrypted saved password. Idle, workstation-lock, and suspend notifications hide all terminal views, detach local input, and cancel pending credential brokers. Output and protocol replies continue for authenticated sessions while locked. Credential fields are managed by Slint; clearing a field releases its value but does not promise forensic erasure of framework-managed string copies. Data keys and explicit secret buffers retain their clearing behavior.
+
+An application-rendered terminal image sits beneath an open shortcuts dropdown while the native child is hidden and detached. The image is released when the menu closes, the session ends, or the vault locks. Capturing it does not access the desktop, other applications, or the clipboard.
+
+Session-tab close confirmation uses a modal Slint popup with an initially unchecked **Do not show this again** checkbox. Confirming with it checked saves a per-user preference under the protected application directory; cancellation never saves the preference. Native terminal views are hidden and detached while the popup is open, and locking the vault dismisses any pending close request. App-exit and inventory-deletion confirmations keep their existing behavior.
+
+The server editor generates Ed25519 pairs through the absolute Windows-system `ssh-keygen.exe` path on a background worker. An isolated, hidden ConPTY answers the two masked prompts so optional passphrases never enter arguments, environment variables, temporary files, the visible terminal, or the clipboard. Owned input/output buffers are cleared. Generation has a timeout and cancellation; closing the editor, locking, or exiting cancels pending work and removes only files in that job's exclusively created directory. Each pair uses a random directory under the protected `keys` folder, and both key files receive an explicit user-only DACL. Successfully displayed pairs persist independently of the vault; the encrypted inventory holds their private-key paths. Public-key loading accepts bounded Ed25519 `.pub` files and never displays private-key contents. The Copy button copies only the validated public key. Passphrases are optional, separate from the vault master, and cleared after generation starts. Encrypted generated keys use OpenSSH's normal terminal/agent passphrase workflow on connection.
+
+The Slint royalty-free desktop license is used with its `AboutSlint` attribution widget in the application's About screen. The project adds compiled UI dependencies; it does not introduce a webview, Qt, or an app-specific installed runtime. See [Slint licensing](https://slint.dev/agreements/slint-royalty-free-license.pdf). Application code retains the repository's MIT license.
+
+The pinned Winit 0.30 integration hook creates opaque native windows. Slint's default transparent host would allow GDI terminal painting, which clears pixel alpha, to expose windows beneath the application. Transparency is disabled before window creation; translucent controls and the close-dialog backdrop still blend within the application normally.
+
+`scripts/check-terminal-opacity.ps1` checks the displayed terminal over an owned white test window in disposable preview mode. It compares one composited screen pixel inside the terminal with the terminal's painted pixel, catching transparency that the application-rendered preview snapshots cannot detect. It requires an interactive Windows desktop and records no screenshot.
+
+`--ui-preview` uses a disposable workspace in `.scratch`, sample hosts, and sample terminal output. It does not load the user's vault or connect to the sample hosts. `--ui-smoke-test` additionally runs callback, encryption, password clearing, session selection/closing, and workstation lock/unlock checks before exiting. The integration test launches this mode in a separate process so Winit runs on that process's main thread.
+
+The portable GNU/LLVM build uses a small project-local linker wrapper for Rust procedural-macro DLLs. It normalizes generated response/definition line endings, chooses the x64 DLL CRT entry point, and invokes LLVM directly. It is build tooling and is not required to run the application.
+
+Linux portability, replacing the terminal renderer, and validating a complete MSVC release build remain separate work.

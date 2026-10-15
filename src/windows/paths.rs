@@ -53,16 +53,7 @@ impl AppPaths {
         secure_directory(&root)?;
         let database_dir = root.join("database");
         secure_directory(&database_dir)?;
-        let mut system = vec![0_u16; 32768];
-        // SAFETY: the output allocation holds 32768 UTF-16 code units.
-        let length =
-            unsafe { GetSystemDirectoryW(system.as_mut_ptr(), system.len() as u32) } as usize;
-        if length == 0 || length >= system.len() {
-            return Err("Cannot locate the Windows system directory.".into());
-        }
-        let ssh = PathBuf::from(String::from_utf16_lossy(&system[..length]))
-            .join("OpenSSH")
-            .join("ssh.exe");
+        let ssh = system_openssh_directory()?.join("ssh.exe");
         let known_hosts = root.join("known_hosts");
         reject_reparse_point(&known_hosts)?;
         Ok(Self {
@@ -74,7 +65,35 @@ impl AppPaths {
     }
 }
 
-fn reject_reparse_point(path: &Path) -> Result<()> {
+pub(crate) fn system_openssh_directory() -> Result<PathBuf> {
+    let mut system = vec![0_u16; 32768];
+    // SAFETY: the output allocation holds 32768 UTF-16 code units.
+    let length = unsafe { GetSystemDirectoryW(system.as_mut_ptr(), system.len() as u32) } as usize;
+    if length == 0 || length >= system.len() {
+        return Err("Cannot locate the Windows system directory.".into());
+    }
+    Ok(PathBuf::from(String::from_utf16_lossy(&system[..length])).join("OpenSSH"))
+}
+
+pub(crate) fn secure_file(path: &Path) -> Result<()> {
+    reject_reparse_point(path)?;
+    let security = private_security()?;
+    let name = path_wide(path);
+    // SAFETY: the validated file name and owned descriptor remain alive during the ACL update.
+    if unsafe {
+        SetFileSecurityW(
+            name.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            security.attributes().lpSecurityDescriptor,
+        )
+    } == 0
+    {
+        return Err("Cannot restrict the SSH key file to your Windows account.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_reparse_point(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
             Err("The application data path contains a link or reparse point. Use a normal per-user directory.".into())

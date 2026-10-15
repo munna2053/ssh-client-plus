@@ -7,6 +7,8 @@ description = "Windows-native SSH manager using system OpenSSH and Windows secur
 license = "MIT"
 
 [target.'cfg(windows)'.dependencies]
+slint = { version = "=1.13.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "software-renderer-systemfonts", "accessibility", "raw-window-handle-06", "compat-1-2", "unstable-winit-030"] }
+raw-window-handle = "=0.6.2"
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

@@ -1,0 +1,97 @@
+export global Colors {
+    out property <color> canvas: #0c1019;
+    out property <color> panel: #131b29;
+    out property <color> surface: #1a2537;
+    out property <color> border: #2b3850;
+    out property <color> text: #f0f3fa;
+    out property <color> muted: #9aabc3;
+    out property <color> accent: #a18aff;
+    out property <color> green: #72dbb1;
+}
+
+export component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked;
+    public function take-focus() { focus.focus(); }
+    height: 36px;
+    min-width: 36px;
+    border-radius: 9px;
+    background: !root.enabled ? Colors.surface : touch.pressed ? (root.primary ? #7861d8 : #26344d) : touch.has-hover ? (root.primary ? #b19eff : #25334b) : root.primary ? Colors.accent : Colors.surface;
+    border-width: 1px;
+    border-color: focus.has-focus ? Colors.accent : touch.has-hover ? #53607c : root.primary ? transparent : Colors.border;
+    opacity: root.enabled ? 1 : 0.45;
+    animate background, border-color, opacity { duration: 150ms; easing: ease-out; }
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    Text {
+        width: parent.width;
+        height: parent.height - 2px;
+        text: root.text;
+        color: root.primary ? #141023 : Colors.text;
+        font-size: 13px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        y: touch.pressed ? 1px : 0px;
+        animate y { duration: 80ms; }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { focus.focus(); root.clicked(); }
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        width: 0px;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+}
+
+export component Field inherits Rectangle {
+    in property <string> label;
+    in property <string> placeholder;
+    in property <bool> secret: false;
+    in property <bool> enabled: true;
+    in-out property <string> text;
+    callback accepted;
+    callback edited;
+    height: 68px;
+    background: transparent;
+    forward-focus: input;
+    Text { x: 0px; y: 0px; text: root.label; color: Colors.muted; height: 20px; font-size: 12px; }
+    Rectangle {
+        y: 26px; height: 40px;
+        background: Colors.surface;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: input.has-focus ? Colors.accent : Colors.border;
+        animate border-color { duration: 140ms; }
+        if root.text == "" : Text {
+            x: 12px; width: parent.width - 24px;
+            text: root.placeholder; color: #70829e;
+            font-size: 14px; vertical-alignment: center;
+        }
+        input := TextInput {
+            enabled: root.enabled;
+            x: 12px; width: parent.width - 24px;
+            text <=> root.text;
+            color: Colors.text;
+            selection-background-color: #564780;
+            selection-foreground-color: Colors.text;
+            font-size: 14px;
+            vertical-alignment: center;
+            single-line: true;
+            input-type: root.secret ? InputType.password : InputType.text;
+            accepted => { root.accepted(); }
+            edited => { root.edited(); }
+        }
+    }
+}

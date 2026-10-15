@@ -84,6 +84,14 @@ pub struct SshSession {
 }
 
 impl SshSession {
+    #[cfg(test)]
+    pub(crate) fn from_test_process(process: PtyProcess) -> Self {
+        Self {
+            process,
+            credential: None,
+        }
+    }
+
     pub fn input(&self) -> std::sync::mpsc::SyncSender<Secret> {
         self.process.input()
     }
