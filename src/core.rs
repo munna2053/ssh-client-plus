@@ -4,6 +4,91 @@ const MAX_HOSTS: usize = 1_000;
 const MAX_FIELD_BYTES: usize = 4_096;
 pub const MAX_VAULT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SSH_PASSWORD_BYTES: usize = 1022;
+pub const MAX_SHORTCUTS: usize = 100;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandShortcut {
+    pub name: String,
+    pub command: String,
+}
+
+impl CommandShortcut {
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty()
+            || self.name.len() > 80
+            || self.name.chars().any(char::is_control)
+        {
+            return Err(
+                "Enter a shortcut name of up to 80 bytes without control characters.".into(),
+            );
+        }
+        if self.command.trim().is_empty()
+            || self.command.len() > MAX_FIELD_BYTES
+            || self.command.chars().any(char::is_control)
+        {
+            return Err(
+                "Enter a single-line command of up to 4,096 bytes without control characters."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+// Keep reading the original host-only payload, and version the expanded workspace separately.
+pub fn encode_inventory(hosts: &[Host], shortcuts: &[CommandShortcut]) -> Result<Vec<u8>> {
+    if shortcuts.len() > MAX_SHORTCUTS {
+        return Err("You can save up to 100 custom shortcuts.".into());
+    }
+    let hosts = encode_hosts(hosts)?;
+    let mut bytes = b"SSH-WORKSPACE\x01".to_vec();
+    bytes.extend_from_slice(&(hosts.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&hosts);
+    bytes.extend_from_slice(&(shortcuts.len() as u32).to_le_bytes());
+    for shortcut in shortcuts {
+        shortcut.validate()?;
+        for field in [&shortcut.name, &shortcut.command] {
+            bytes.extend_from_slice(&(field.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(field.as_bytes());
+        }
+    }
+    if bytes.len() > MAX_VAULT_BYTES {
+        return Err("Workspace exceeds the vault size limit.".into());
+    }
+    Ok(bytes)
+}
+
+pub fn decode_inventory(bytes: &[u8]) -> Result<(Vec<Host>, Vec<CommandShortcut>)> {
+    if bytes.starts_with(b"SSH-HOSTS") {
+        return Ok((decode_hosts(bytes)?, vec![]));
+    }
+    if bytes.len() > MAX_VAULT_BYTES {
+        return Err("Workspace exceeds the vault size limit.".into());
+    }
+    let mut reader = Reader::new(bytes);
+    if reader.take(14)? != b"SSH-WORKSPACE\x01" {
+        return Err("Unsupported workspace format.".into());
+    }
+    let host_bytes = reader.u32()? as usize;
+    let hosts = decode_hosts(reader.take(host_bytes)?)?;
+    let count = reader.u32()? as usize;
+    if count > MAX_SHORTCUTS {
+        return Err("Too many command shortcuts.".into());
+    }
+    let mut shortcuts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let shortcut = CommandShortcut {
+            name: reader.string()?,
+            command: reader.string()?,
+        };
+        shortcut.validate()?;
+        shortcuts.push(shortcut);
+    }
+    if !reader.finished() {
+        return Err("Unexpected data after workspace records.".into());
+    }
+    Ok((hosts, shortcuts))
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Authentication {
@@ -96,7 +181,7 @@ pub enum ReadOnlyAction {
 }
 
 impl ReadOnlyAction {
-    pub fn command(self) -> &'static str {
+    pub const fn command(self) -> &'static str {
         match self {
             Self::System => "uname -a; cat /etc/os-release",
             Self::Uptime => "uptime",
@@ -105,6 +190,52 @@ impl ReadOnlyAction {
         }
     }
 }
+
+pub const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
+    ("System info", ReadOnlyAction::System.command()),
+    ("Uptime", ReadOnlyAction::Uptime.command()),
+    ("Disk usage", ReadOnlyAction::Disk.command()),
+    ("Memory", ReadOnlyAction::Memory.command()),
+    ("CPU info", "lscpu"),
+    ("Block devices", "lsblk -f"),
+    ("Directory sizes", "du -h --max-depth=1 . | sort -h"),
+    (
+        "Top CPU processes",
+        "ps -eo pid,ppid,user,%cpu,%mem,args --sort=-%cpu | head -n 21",
+    ),
+    (
+        "Top memory processes",
+        "ps -eo pid,ppid,user,%mem,%cpu,args --sort=-%mem | head -n 21",
+    ),
+    ("Logged-in users", "w"),
+    ("Last logins", "last -n 20"),
+    ("Network addresses", "ip -br address"),
+    ("Network routes", "ip route"),
+    ("Listening ports", "ss -tuln"),
+    ("Network connections", "ss -tun"),
+    ("Failed services", "systemctl --failed --no-pager"),
+    (
+        "Running services",
+        "systemctl list-units --type=service --state=running --no-pager",
+    ),
+    ("Recent system logs", "journalctl -n 100 --no-pager"),
+    (
+        "Recent system errors",
+        "journalctl -p err -n 100 --no-pager",
+    ),
+    ("Docker containers", "docker ps"),
+    ("Docker all containers", "docker ps -a"),
+    ("Docker disk usage", "docker system df"),
+    ("Docker resource usage", "docker stats --no-stream"),
+    ("Compose services", "docker compose ps"),
+    ("Kubernetes pods", "kubectl get pods -A -o wide"),
+    ("Kubernetes nodes", "kubectl get nodes -o wide"),
+    ("Kubernetes deployments", "kubectl get deployments -A"),
+    (
+        "Kubernetes events",
+        "kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -n 51",
+    ),
+];
 
 // Length-prefixed UTF-8 fields. This codec is versioned and bounds all allocation.
 pub fn encode_hosts(hosts: &[Host]) -> Result<Vec<u8>> {
@@ -243,6 +374,90 @@ pub fn decode_hosts(bytes: &[u8]) -> Result<Vec<Host>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_shortcuts_have_unique_names_and_insertable_single_line_commands() {
+        let mut names = std::collections::BTreeSet::new();
+        for (name, command) in BUILTIN_SHORTCUTS {
+            assert!(
+                names.insert(name.to_lowercase()),
+                "Duplicate shortcut: {name}"
+            );
+            CommandShortcut {
+                name: (*name).into(),
+                command: (*command).into(),
+            }
+            .validate()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn workspace_shortcuts_round_trip_and_migrate_host_only_inventory() {
+        let hosts = vec![host()];
+        let shortcuts = vec![CommandShortcut {
+            name: "Container status".into(),
+            command: "docker ps --format '{{.Names}}'".into(),
+        }];
+        let bytes = encode_inventory(&hosts, &shortcuts).unwrap();
+        assert_eq!(
+            decode_inventory(&bytes).unwrap(),
+            (hosts.clone(), shortcuts)
+        );
+        assert_eq!(
+            decode_inventory(&encode_hosts(&hosts).unwrap()).unwrap(),
+            (hosts, vec![])
+        );
+        for end in 0..bytes.len() {
+            assert!(decode_inventory(&bytes[..end]).is_err());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode_inventory(&trailing).is_err());
+        let mut excessive = encode_inventory(&[], &[]).unwrap();
+        let end = excessive.len();
+        excessive[end - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_inventory(&excessive).is_err());
+    }
+
+    #[test]
+    fn shortcuts_reject_control_characters_empty_fields_and_oversized_records() {
+        for command in [
+            "",
+            "   ",
+            "uptime\nreboot",
+            "uptime\r",
+            "\x1b[200~id",
+            "echo\0secret",
+            "echo\tsecret",
+        ] {
+            assert!(
+                CommandShortcut {
+                    name: "Test".into(),
+                    command: command.into()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for name in ["", "  ", "Test\n"] {
+            assert!(
+                CommandShortcut {
+                    name: name.into(),
+                    command: "uptime".into()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let mut shortcut = CommandShortcut {
+            name: "Test".into(),
+            command: "x".repeat(MAX_FIELD_BYTES + 1),
+        };
+        assert!(shortcut.validate().is_err());
+        shortcut.command = "uptime".into();
+        assert!(encode_inventory(&[], &vec![shortcut; MAX_SHORTCUTS + 1]).is_err());
+    }
 
     fn host() -> Host {
         Host {

@@ -3,6 +3,7 @@ import { Colors, ActionButton, MenuAction, Field } from "components.slint";
 
 export struct ServerRow { name: string, destination: string, password-login: bool }
 export struct SessionRow { name: string, running: bool }
+export struct ShortcutRow { name: string, command: string }
 
 export component Workspace inherits Window {
     title: "SentinelSSH";
@@ -14,6 +15,22 @@ export component Workspace inherits Window {
     init => { Palette.color-scheme = ColorScheme.dark; }
     in property <[ServerRow]> servers;
     in property <[SessionRow]> sessions;
+    in property <[ShortcutRow]> shortcuts;
+    in property <[ShortcutRow]> custom-shortcuts;
+    in property <int> builtin-shortcut-count;
+    in-out property <length> server-scroll-y: 0px;
+    in property <string> database-location;
+    in-out property <bool> settings-open: false;
+    in-out property <string> settings-message;
+    in-out property <length> settings-scroll-y: 0px;
+    in-out property <string> current-passphrase;
+    in-out property <string> new-passphrase;
+    in-out property <string> new-passphrase-confirmation;
+    in-out property <bool> delete-data-open: false;
+    in-out property <string> delete-data-confirmation;
+    in-out property <bool> shortcut-editor-open: false;
+    in-out property <string> shortcut-name;
+    in-out property <string> shortcut-command;
     in property <bool> unlocked;
     in property <bool> creating;
     in property <bool> editor-open;
@@ -51,7 +68,17 @@ export component Workspace inherits Window {
     out property <length> terminal-y: 52px;
     out property <length> terminal-width: root.width - root.terminal-x - 8px;
     out property <length> terminal-height: root.height - 78px;
-    out property <bool> terminal-visible: root.unlocked && !root.editor-open && !root.about-open && !root.shortcuts-open && !root.app-menu-open && !root.close-confirmation-open;
+    out property <bool> terminal-visible: root.unlocked && !root.editor-open && !root.about-open && !root.settings-open && !root.shortcuts-open && !root.app-menu-open && !root.close-confirmation-open;
+    callback open-settings;
+    callback close-settings;
+    callback copy-database-location;
+    callback change-vault-key;
+    callback delete-all-server-data;
+    callback new-shortcut;
+    callback save-shortcut;
+    callback delete-shortcut(int);
+    callback reset-settings-scroll;
+    reset-settings-scroll => { root.settings-scroll-y = 0px; }
     callback unlock;
     callback lock;
     callback toggle-servers;
@@ -91,6 +118,11 @@ export component Workspace inherits Window {
         Image { x: 10px; y: 9px; width: 16px; height: 16px; source: @image-url("icons/menu.svg"); colorize: Colors.text; }
     }
     ActionButton {
+        x: root.width - 132px; y: 6px; width: 80px; height: 34px;
+        text: "Settings"; flat: !root.settings-open; enabled: root.unlocked;
+        clicked => { root.open-settings(); }
+    }
+    ActionButton {
         x: root.width - 44px; y: 6px; width: 36px; height: 34px;
         flat: !root.app-menu-open; accessible-label: "Application menu";
         clicked => { root.open-app-menu(); }
@@ -105,7 +137,8 @@ export component Workspace inherits Window {
         x: parent.width - self.width; width: 304px; height: parent.height;
         background: Colors.panel; border-radius: 10px;
         border-width: 1px; border-color: #202b3c;
-        Text { x: 16px; y: 19px; text: "SERVERS  ·  " + root.servers.length; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: Colors.muted; }
+        Text { x: 16px; y: 13px; text: "SERVERS  ·  " + root.servers.length; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: Colors.muted; }
+        Text { x: 16px; y: 31px; text: "Last used first"; font-size: 10px; color: Colors.muted; }
         ActionButton { x: parent.width - 40px; y: 10px; width: 28px; height: 28px; text: "×"; flat: true; accessible-label: "Close server drawer"; clicked => { root.toggle-servers(); } }
         if !root.unlocked || root.servers.length == 0 : Text {
             x: 18px; y: 67px; width: parent.width - 36px; wrap: word-wrap;
@@ -116,6 +149,8 @@ export component Workspace inherits Window {
             x: 12px; y: 49px; width: parent.width - 24px; height: parent.height - 117px;
             viewport-width: self.width;
             viewport-height: max(self.height, root.servers.length * 116px);
+            viewport-y <=> root.server-scroll-y;
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
             for server[index] in root.servers : Rectangle {
                 y: index * 116px; height: 106px; width: parent.width - 8px;
                 border-radius: 10px;
@@ -137,7 +172,7 @@ export component Workspace inherits Window {
     }
 
     if root.unlocked : Rectangle {
-        x: 116px; y: 6px; width: root.width - 300px; height: 34px; background: transparent;
+        x: 116px; y: 6px; width: root.width - 388px; height: 34px; background: transparent;
         ScrollView {
             x: 0px; y: 0px;
             width: parent.width; height: 38px;
@@ -145,9 +180,9 @@ export component Workspace inherits Window {
             viewport-width: max(self.width, root.sessions.length * 178px);
             for session[index] in root.sessions : Rectangle {
                 x: index * 178px; y: 0px; width: 172px; height: 34px;
-                background: root.active-session == index && !root.editor-open ? #2b3550 : tab-touch.has-hover ? #202d43 : Colors.panel;
+                background: root.active-session == index && !root.editor-open && !root.settings-open && !root.about-open ? #2b3550 : tab-touch.has-hover ? #202d43 : Colors.panel;
                 border-radius: 9px;
-                border-width: 1px; border-color: root.active-session == index && !root.editor-open ? #756592 : Colors.border;
+                border-width: 1px; border-color: root.active-session == index && !root.editor-open && !root.settings-open && !root.about-open ? #756592 : Colors.border;
                 animate background, border-color { duration: 150ms; }
                 tab-touch := TouchArea { mouse-cursor: pointer; clicked => { root.select-session(index); } }
                 Rectangle { x: 12px; y: 14px; width: 6px; height: 6px; border-radius: 3px; background: session.running ? Colors.green : Colors.muted; }
@@ -157,13 +192,13 @@ export component Workspace inherits Window {
         }
     }
         ActionButton {
-            x: root.width - 176px; y: 6px; width: 124px; height: 34px; text: "Shortcuts    "; flat: true;
-            enabled: root.active-running;
+            x: root.width - 264px; y: 6px; width: 124px; height: 34px; text: "Shortcuts    "; flat: true;
+            enabled: root.unlocked;
             clicked => { if root.shortcuts-open { root.close-shortcuts(); } else { root.open-shortcuts(); } }
             Image { x: parent.width - 24px; y: 11px; width: 12px; height: 12px; source: @image-url("icons/chevron-down.svg"); colorize: Colors.text; }
         }
 
-    if root.unlocked && !root.editor-open && !root.about-open : Rectangle {
+    if root.unlocked && !root.editor-open && !root.about-open && !root.settings-open : Rectangle {
         x: root.terminal-x - 1px; y: root.terminal-y - 1px;
         width: root.terminal-width + 2px; height: root.terminal-height + 2px;
         background: #0b1018; border-width: 1px; border-color: Colors.border; border-radius: 10px;
@@ -259,16 +294,76 @@ export component Workspace inherits Window {
         }
     }
 
-    if root.shortcuts-open : TouchArea { clicked => { root.close-shortcuts(); } }
-    if root.shortcuts-open && root.unlocked && root.active-running : Rectangle {
-        x: root.width - 242px; y: 46px; width: 190px; height: 174px;
-        background: Colors.panel; border-width: 1px; border-color: Colors.border; border-radius: 10px;
-        VerticalLayout {
-            padding: 10px; spacing: 5px;
-            ActionButton { text: "System info"; clicked => { root.close-shortcuts(); root.insert-shortcut(0); } }
-            ActionButton { text: "Uptime"; clicked => { root.close-shortcuts(); root.insert-shortcut(1); } }
-            ActionButton { text: "Disk usage"; clicked => { root.close-shortcuts(); root.insert-shortcut(2); } }
-            ActionButton { text: "Memory"; clicked => { root.close-shortcuts(); root.insert-shortcut(3); } }
+    if root.unlocked && root.settings-open : Rectangle {
+        x: root.terminal-x; y: root.terminal-y; width: root.terminal-width; height: root.terminal-height;
+        background: Colors.canvas;
+        settings-scroll := ScrollView {
+            viewport-width: self.width;
+            viewport-y <=> root.settings-scroll-y;
+            VerticalLayout {
+                width: min(parent.width - 24px, 760px); spacing: 16px;
+                HorizontalLayout {
+                    Text { text: "Settings"; color: Colors.text; font-size: 24px; font-weight: 700; }
+                    ActionButton { width: 100px; text: "Done"; clicked => { root.close-settings(); } }
+                }
+                if root.settings-message != "" : Text { text: root.settings-message; color: Colors.accent; wrap: word-wrap; }
+                if root.shortcut-editor-open : VerticalLayout {
+                    spacing: 12px;
+                    Text { text: "New command shortcut"; color: Colors.text; font-size: 17px; font-weight: 600; }
+                    Field { label: "Shortcut name"; placeholder: "e.g. Docker containers"; text <=> root.shortcut-name; }
+                    Field { label: "Command"; placeholder: "docker ps"; text <=> root.shortcut-command; }
+                    HorizontalLayout {
+                        spacing: 12px; alignment: start;
+                        ActionButton { width: 140px; text: "Save shortcut"; primary: true; clicked => { root.save-shortcut(); } }
+                        ActionButton { width: 100px; text: "Cancel"; clicked => { root.shortcut-editor-open = false; root.shortcut-name = ""; root.shortcut-command = ""; } }
+                    }
+                    Rectangle { height: 1px; background: Colors.border; }
+                }
+                Text { text: "Database"; color: Colors.text; font-size: 17px; font-weight: 600; }
+                Field { label: "Database location"; text: root.database-location; read-only: true; }
+                Text { text: "Keep vault.edb and its logs together in this folder."; color: Colors.muted; font-size: 12px; wrap: word-wrap; }
+                ActionButton { width: 140px; text: "Copy location"; clicked => { root.copy-database-location(); } }
+                Rectangle { height: 1px; background: Colors.border; }
+                Text { text: "Change vault key"; color: Colors.text; font-size: 17px; font-weight: 600; }
+                Text { text: "Change the master passphrase used to unlock your vault. Use at least 12 characters."; color: Colors.muted; wrap: word-wrap; font-size: 12px; }
+                Field { label: "Current master passphrase"; secret: true; text <=> root.current-passphrase; }
+                HorizontalLayout {
+                    spacing: 14px;
+                    Field { label: "New master passphrase"; secret: true; text <=> root.new-passphrase; }
+                    Field { label: "Confirm new passphrase"; secret: true; text <=> root.new-passphrase-confirmation; }
+                }
+                ActionButton { width: 170px; text: "Change vault key"; primary: true; clicked => { root.change-vault-key(); } }
+                Rectangle { height: 1px; background: Colors.border; }
+                HorizontalLayout {
+                    Text { text: "Command shortcuts"; color: Colors.text; font-size: 17px; font-weight: 600; }
+                    ActionButton { width: 150px; text: "+ New shortcut"; clicked => { root.new-shortcut(); } }
+                }
+                Text { text: "Saved in your encrypted vault. Select a shortcut to insert it, then press Enter in the terminal to run it."; color: Colors.muted; wrap: word-wrap; font-size: 12px; }
+                Text { text: root.builtin-shortcut-count + " built-in shortcuts are available in Shortcuts, including Linux diagnostics, Docker, and Kubernetes. These require the corresponding tools on your server."; color: Colors.muted; wrap: word-wrap; font-size: 12px; }
+                if root.custom-shortcuts.length == 0 : Text { text: "No custom shortcuts yet."; color: Colors.muted; font-size: 12px; }
+                for shortcut[index] in root.custom-shortcuts : HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout {
+                        Text { text: shortcut.name; color: Colors.text; font-size: 13px; }
+                        Text { text: shortcut.command; color: Colors.muted; font-size: 12px; wrap: char-wrap; }
+                    }
+                    ActionButton { width: 80px; text: "Remove"; clicked => { root.delete-shortcut(index + root.builtin-shortcut-count); } }
+                }
+                Rectangle { height: 1px; background: Colors.border; }
+                Text { text: "Delete all server data"; color: #f59b9b; font-size: 17px; font-weight: 600; }
+                Text { text: "Remove all saved servers and passwords and close every session. This cannot be undone. SSH key files, host trust entries, and command shortcuts are kept."; color: Colors.muted; wrap: word-wrap; font-size: 12px; }
+                if !root.delete-data-open : ActionButton { width: 190px; text: "Delete all server data..."; clicked => { root.delete-data-open = true; root.delete-data-confirmation = ""; root.activity(); } }
+                if root.delete-data-open : VerticalLayout {
+                    spacing: 12px;
+                    Field { label: "Type DELETE to confirm"; text <=> root.delete-data-confirmation; }
+                    HorizontalLayout {
+                        spacing: 12px; alignment: start;
+                        ActionButton { width: 190px; text: "Delete all server data"; enabled: root.delete-data-confirmation == "DELETE"; clicked => { root.delete-all-server-data(); } }
+                        ActionButton { width: 100px; text: "Cancel"; clicked => { root.delete-data-open = false; root.delete-data-confirmation = ""; } }
+                    }
+                }
+                Rectangle { height: 16px; }
+            }
         }
     }
 
@@ -286,6 +381,26 @@ export component Workspace inherits Window {
         }
     }
 
+    if root.shortcuts-open : TouchArea { clicked => { root.close-shortcuts(); } }
+    if root.shortcuts-open && root.unlocked : Rectangle {
+        x: root.width - 380px; y: 46px; width: 240px; height: min(root.height - 80px, root.shortcuts.length * 40px + 74px);
+        background: Colors.panel; border-width: 1px; border-color: Colors.border; border-radius: 10px;
+        VerticalLayout {
+            padding: 10px; spacing: 5px;
+            ScrollView {
+                viewport-width: self.width;
+                viewport-height: root.shortcuts.length * 40px;
+                for shortcut[index] in root.shortcuts : MenuAction {
+                    y: index * 40px; width: parent.width - 8px; height: 36px;
+                    label: shortcut.name; enabled: root.active-running;
+                    clicked => { root.close-shortcuts(); root.insert-shortcut(index); }
+                }
+            }
+            Rectangle { height: 1px; background: Colors.border; }
+            ActionButton { text: "+ New shortcut"; clicked => { root.new-shortcut(); } }
+        }
+    }
+
     app-menu := PopupWindow {
         x: 0px; y: 0px; width: root.width; height: root.height;
         close-policy: PopupClosePolicy.no-auto-close;
@@ -296,7 +411,7 @@ export component Workspace inherits Window {
             }
             TouchArea { clicked => { root.close-app-menu(); } }
             Rectangle {
-                x: root.width - 300px; y: 46px; width: 292px; height: 374px;
+                x: root.width - 300px; y: 46px; width: 292px; height: 414px;
                 background: Colors.panel; border-radius: 10px; border-width: 1px; border-color: Colors.border;
                 init => { if root.unlocked { menu-new.take-focus(); } else { menu-about.take-focus(); } }
                 TouchArea { }
@@ -315,6 +430,7 @@ export component Workspace inherits Window {
                     Rectangle { height: 1px; background: Colors.border; }
                     menu-new := MenuAction { label: "New server"; enabled: root.unlocked; clicked => { root.close-app-menu(); root.new-server(); } }
                     MenuAction { label: root.drawer-open ? "Hide servers" : "Show servers"; enabled: root.unlocked; clicked => { root.close-app-menu(); root.toggle-servers(); } }
+                    MenuAction { label: "Settings"; enabled: root.unlocked; clicked => { root.open-settings(); } }
                     MenuAction { label: "Lock vault"; enabled: root.unlocked; clicked => { root.close-app-menu(); root.lock(); } }
                     Rectangle { height: 1px; background: Colors.border; }
                     menu-about := MenuAction { label: "About SentinelSSH"; clicked => { root.close-app-menu(); root.open-about(); } }

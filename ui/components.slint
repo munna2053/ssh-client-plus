@@ -60,7 +60,7 @@ export component MenuAction inherits ActionButton {
     in property <string> label;
     flat: true;
     accessible-label: root.label;
-    Text { x: 12px; width: parent.width - 24px; height: parent.height; text: root.label; color: Colors.text; vertical-alignment: center; font-size: 13px; }
+    Text { x: 12px; width: parent.width - 24px; height: parent.height; text: root.label; color: Colors.text; vertical-alignment: center; font-size: 13px; overflow: elide; }
 }
 
 export component Field inherits Rectangle {
@@ -68,6 +68,7 @@ export component Field inherits Rectangle {
     in property <string> placeholder;
     in property <bool> secret: false;
     in property <bool> enabled: true;
+    in property <bool> read-only: false;
     in-out property <string> text;
     callback accepted;
     callback edited;
@@ -89,6 +90,7 @@ export component Field inherits Rectangle {
         }
         input := TextInput {
             enabled: root.enabled;
+            read-only: root.read-only;
             x: 12px; width: parent.width - 24px;
             text <=> root.text;
             color: Colors.text;

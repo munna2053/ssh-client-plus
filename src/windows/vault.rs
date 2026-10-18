@@ -2,8 +2,8 @@ use super::crypto::{self, DecryptError, Secret};
 use crate::{
     Result,
     core::{
-        Host, MAX_SSH_PASSWORD_BYTES, MAX_VAULT_BYTES, Reader, SavedPassword, decode_hosts,
-        encode_hosts,
+        CommandShortcut, Host, MAX_SSH_PASSWORD_BYTES, MAX_VAULT_BYTES, Reader, SavedPassword,
+        decode_inventory, encode_inventory,
     },
 };
 
@@ -14,6 +14,7 @@ const HOST_AAD: &[u8] = b"SentinelSSH/v1/host-inventory";
 pub struct UnlockedVault {
     data_key: Secret,
     header: Vec<u8>,
+    pub shortcuts: Vec<CommandShortcut>,
 }
 
 /// Nonsecret envelope metadata; inspecting it never attempts a master passphrase.
@@ -76,6 +77,29 @@ impl UnlockedVault {
     }
 
     pub fn create(password: &Secret) -> Result<Self> {
+        let data_key = Secret(crypto::random::<32>()?.to_vec());
+        let header = Self::wrap_key(password, &data_key)?;
+        Ok(Self {
+            data_key,
+            header,
+            shortcuts: vec![],
+        })
+    }
+
+    // Rewrap the same data key so existing encrypted server passwords remain usable.
+    pub fn change_passphrase(&self, password: &Secret) -> Result<Self> {
+        let header = Self::wrap_key(password, &self.data_key)?;
+        Ok(Self {
+            data_key: Secret(self.data_key.0.clone()),
+            header,
+            shortcuts: self.shortcuts.clone(),
+        })
+    }
+
+    fn wrap_key(password: &Secret, data_key: &Secret) -> Result<Vec<u8>> {
+        if password.0.len() > 4096 {
+            return Err("Master passphrase is too long.".into());
+        }
         let passphrase =
             std::str::from_utf8(&password.0).map_err(|_| "Invalid passphrase text.")?;
         if passphrase.chars().count() < 12 {
@@ -83,7 +107,6 @@ impl UnlockedVault {
         }
         let salt = crypto::random::<32>()?;
         let kek = crypto::derive(password, &salt, ITERATIONS)?;
-        let data_key = Secret(crypto::random::<32>()?.to_vec());
         let mut header = MAGIC.to_vec();
         header.extend_from_slice(&ITERATIONS.to_le_bytes());
         header.extend_from_slice(&salt);
@@ -91,7 +114,7 @@ impl UnlockedVault {
         let bound = crypto::dpapi(&wrapped, false)?;
         header.extend_from_slice(&(bound.len() as u32).to_le_bytes());
         header.extend_from_slice(&bound);
-        Ok(Self { data_key, header })
+        Ok(header)
     }
 
     pub fn unlock(password: &Secret, bytes: &[u8]) -> Result<(Self, Vec<Host>)> {
@@ -124,20 +147,29 @@ impl UnlockedVault {
             DecryptError::Authentication => "Master passphrase verified, but the saved inventory failed authentication. Keep the database and logs for recovery. [VAULT_DATA_AUTH]".to_string(),
             other => format!("Vault key verified, but inventory decryption failed: {other}"),
         })?;
-        let hosts = decode_hosts(&plaintext.0).map_err(|error| {
+        let (hosts, shortcuts) = decode_inventory(&plaintext.0).map_err(|error| {
             format!("Vault key verified, but the saved inventory format is invalid: {error}")
         })?;
         Ok((
             Self {
                 data_key,
                 header: bytes[..header_end].to_vec(),
+                shortcuts,
             },
             hosts,
         ))
     }
 
     pub fn seal(&self, hosts: &[Host]) -> Result<Vec<u8>> {
-        let plaintext = Secret(encode_hosts(hosts)?);
+        self.seal_with_shortcuts(hosts, &self.shortcuts)
+    }
+
+    pub fn seal_with_shortcuts(
+        &self,
+        hosts: &[Host],
+        shortcuts: &[CommandShortcut],
+    ) -> Result<Vec<u8>> {
+        let plaintext = Secret(encode_inventory(hosts, shortcuts)?);
         let mut bytes = self.header.clone();
         bytes.extend_from_slice(&crypto::encrypt(&self.data_key, HOST_AAD, &plaintext.0)?);
         Ok(bytes)
@@ -168,6 +200,60 @@ fn validate_password(password: &Secret) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_passphrase_preserves_passwords_and_shortcuts_and_rejects_old_key() {
+        let old = Secret(b"original vault passphrase".to_vec());
+        let new = Secret(
+            "replacement vault passphrase \u{09ac}\u{09be}\u{0982}\u{09b2}\u{09be}"
+                .as_bytes()
+                .to_vec(),
+        );
+        let mut vault = UnlockedVault::create(&old).unwrap();
+        vault.shortcuts.push(CommandShortcut {
+            name: "Logs".into(),
+            command: "journalctl -n 30".into(),
+        });
+        let saved = vault
+            .encrypt_password(&Secret(b"saved server password".to_vec()))
+            .unwrap();
+        let host = Host {
+            name: "Password server".into(),
+            address: "example.com".into(),
+            port: 22,
+            username: "deploy".into(),
+            identity_path: String::new(),
+            authentication: crate::core::Authentication::Password,
+            password: Some(saved),
+        };
+        let original = vault.seal(std::slice::from_ref(&host)).unwrap();
+        assert!(
+            vault
+                .change_passphrase(&Secret(b"too short".to_vec()))
+                .is_err()
+        );
+        assert!(vault.change_passphrase(&Secret(vec![b'a'; 4097])).is_err());
+        let changed = vault.change_passphrase(&new).unwrap();
+        let sealed = changed.seal(&[host]).unwrap();
+        assert!(UnlockedVault::unlock(&old, &sealed).is_err());
+        let (reopened, hosts) = UnlockedVault::unlock(&new, &sealed).unwrap();
+        assert_eq!(reopened.shortcuts, vault.shortcuts);
+        assert_eq!(
+            reopened
+                .decrypt_password(hosts[0].password.as_ref().unwrap())
+                .unwrap()
+                .0,
+            b"saved server password"
+        );
+        assert!(UnlockedVault::unlock(&old, &original).is_ok());
+        for plaintext in [b"journalctl -n 30".as_slice(), b"saved server password"] {
+            assert!(
+                !sealed
+                    .windows(plaintext.len())
+                    .any(|part| part == plaintext)
+            );
+        }
+    }
 
     #[test]
     fn password_required_even_with_windows_account_access() {

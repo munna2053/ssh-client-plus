@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     Result,
-    core::{Authentication, Host, ReadOnlyAction},
+    core::{Authentication, BUILTIN_SHORTCUTS, CommandShortcut, Host, MAX_SHORTCUTS},
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -32,7 +32,7 @@ use windows_sys::Win32::{
 };
 
 slint::slint! {
-    export { Workspace, ServerRow, SessionRow } from "ui/workspace.slint";
+    export { Workspace, ServerRow, SessionRow, ShortcutRow } from "ui/workspace.slint";
 }
 
 const MAX_TABS: usize = 16;
@@ -132,6 +132,9 @@ impl Controller {
     fn status(&self, text: &str) {
         if let Some(ui) = self.ui.upgrade() {
             ui.set_status(text.into());
+            if ui.get_settings_open() {
+                ui.set_settings_message(text.into());
+            }
         }
     }
 
@@ -176,6 +179,188 @@ impl Controller {
             vec![]
         };
         ui.set_sessions(ModelRc::new(VecModel::from(sessions)));
+        ui.set_database_location(
+            self.paths
+                .database_dir
+                .join("vault.edb")
+                .to_string_lossy()
+                .as_ref()
+                .into(),
+        );
+        let mut shortcuts = vec![];
+        if let Some(vault) = &self.vault {
+            shortcuts.extend(BUILTIN_SHORTCUTS.iter().map(|(name, command)| ShortcutRow {
+                name: (*name).into(),
+                command: (*command).into(),
+            }));
+            shortcuts.extend(vault.shortcuts.iter().map(|shortcut| ShortcutRow {
+                name: shortcut.name.as_str().into(),
+                command: shortcut.command.as_str().into(),
+            }));
+        }
+        ui.set_custom_shortcuts(ModelRc::new(VecModel::from(
+            shortcuts
+                .iter()
+                .skip(BUILTIN_SHORTCUTS.len())
+                .cloned()
+                .collect::<Vec<_>>(),
+        )));
+        ui.set_shortcuts(ModelRc::new(VecModel::from(shortcuts)));
+        ui.set_builtin_shortcut_count(BUILTIN_SHORTCUTS.len() as i32);
+    }
+
+    fn close_settings(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_settings_open(false);
+            ui.set_current_passphrase("".into());
+            ui.set_new_passphrase("".into());
+            ui.set_new_passphrase_confirmation("".into());
+            ui.set_delete_data_open(false);
+            ui.set_delete_data_confirmation("".into());
+            ui.set_shortcut_editor_open(false);
+            ui.set_shortcut_name("".into());
+            ui.set_shortcut_command("".into());
+            ui.set_settings_message("".into());
+            ui.set_settings_scroll_y(0.);
+        }
+    }
+
+    fn open_settings(&mut self) -> Result<()> {
+        if self.vault.is_none() {
+            return Err("Unlock the vault first.".into());
+        }
+        self.dismiss_popups();
+        self.dismiss_close_confirmation();
+        self.reset_editor();
+        let ui = self.ui.upgrade().ok_or("Workspace closed.")?;
+        if !ui.get_settings_open() {
+            self.close_settings();
+        }
+        ui.set_editor_open(false);
+        ui.set_about_open(false);
+        ui.set_drawer_open(false);
+        ui.set_settings_open(true);
+        self.sync();
+        self.position_terminals();
+        Ok(())
+    }
+
+    fn change_vault_key(&mut self) -> Result<()> {
+        let ui = self.ui.upgrade().ok_or("Workspace closed.")?;
+        let current = Secret(ui.get_current_passphrase().as_bytes().to_vec());
+        let password = Secret(ui.get_new_passphrase().as_bytes().to_vec());
+        let confirmation = Secret(ui.get_new_passphrase_confirmation().as_bytes().to_vec());
+        ui.set_current_passphrase("".into());
+        ui.set_new_passphrase("".into());
+        ui.set_new_passphrase_confirmation("".into());
+        let vault = self.vault.as_ref().ok_or("Unlock the vault first.")?;
+        if Instant::now() < self.retry_after {
+            return Err("Please wait a few seconds before trying the passphrase again.".into());
+        }
+        if current.0.len() > 4096 || password.0.len() > 4096 {
+            return Err("Master passphrase is too long.".into());
+        }
+        if password.0 != confirmation.0 {
+            return Err("The new master passphrases do not match.".into());
+        }
+        let envelope = self.envelope.as_ref().ok_or("No saved vault found.")?;
+        if let Err(error) = UnlockedVault::unlock(&current, envelope) {
+            self.failures = self.failures.saturating_add(1);
+            self.retry_after =
+                Instant::now() + Duration::from_secs(u64::from(self.failures).min(10));
+            return Err(error);
+        }
+        let next = vault.change_passphrase(&password)?;
+        let sealed = next.seal(&self.hosts)?;
+        // Verify the replacement before the single durable ESE transaction.
+        UnlockedVault::unlock(&password, &sealed)?;
+        self.store.write(&sealed)?;
+        self.envelope = Some(sealed);
+        self.vault = Some(next);
+        self.failures = 0;
+        self.retry_after = Instant::now();
+        self.status("Vault key changed. Use your new master passphrase next time you unlock.");
+        Ok(())
+    }
+
+    fn save_shortcut(&mut self) -> Result<()> {
+        let vault = self.vault.as_ref().ok_or("Unlock the vault first.")?;
+        let ui = self.ui.upgrade().ok_or("Workspace closed.")?;
+        let shortcut = CommandShortcut {
+            name: ui.get_shortcut_name().trim().into(),
+            command: ui.get_shortcut_command().to_string(),
+        };
+        shortcut.validate()?;
+        if vault.shortcuts.len() >= MAX_SHORTCUTS {
+            return Err("You can save up to 100 custom shortcuts.".into());
+        }
+        if BUILTIN_SHORTCUTS
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(&shortcut.name))
+            || vault
+                .shortcuts
+                .iter()
+                .any(|saved| saved.name.eq_ignore_ascii_case(&shortcut.name))
+        {
+            return Err("A shortcut with that name already exists.".into());
+        }
+        let mut next = vault.shortcuts.clone();
+        next.push(shortcut);
+        let sealed = vault.seal_with_shortcuts(&self.hosts, &next)?;
+        self.store.write(&sealed)?;
+        self.envelope = Some(sealed);
+        self.vault.as_mut().unwrap().shortcuts = next;
+        ui.set_shortcut_name("".into());
+        ui.set_shortcut_command("".into());
+        ui.set_shortcut_editor_open(false);
+        self.sync();
+        self.status("Shortcut saved. Choose it from the Shortcuts menu.");
+        Ok(())
+    }
+
+    fn delete_shortcut(&mut self, index: usize) -> Result<()> {
+        let vault = self.vault.as_ref().ok_or("Unlock the vault first.")?;
+        let index = index
+            .checked_sub(BUILTIN_SHORTCUTS.len())
+            .ok_or("Built-in shortcuts cannot be removed.")?;
+        let mut next = vault.shortcuts.clone();
+        if index >= next.len() {
+            return Err("Shortcut no longer exists.".into());
+        }
+        next.remove(index);
+        let sealed = vault.seal_with_shortcuts(&self.hosts, &next)?;
+        self.store.write(&sealed)?;
+        self.envelope = Some(sealed);
+        self.vault.as_mut().unwrap().shortcuts = next;
+        self.sync();
+        self.status("Shortcut removed.");
+        Ok(())
+    }
+
+    fn delete_all_server_data(&mut self) -> Result<()> {
+        let vault = self.vault.as_ref().ok_or("Unlock the vault first.")?;
+        let ui = self.ui.upgrade().ok_or("Workspace closed.")?;
+        if !ui.get_settings_open()
+            || !ui.get_delete_data_open()
+            || ui.get_delete_data_confirmation() != "DELETE"
+        {
+            return Err("Type DELETE in Settings to confirm removing all saved servers.".into());
+        }
+        let sealed = vault.seal(&[])?;
+        self.store.write(&sealed)?;
+        self.envelope = Some(sealed);
+        self.hosts.clear();
+        self.dismiss_close_confirmation();
+        while !self.tabs.is_empty() {
+            self.close_tab(self.tabs.len() - 1)?;
+        }
+        self.reset_editor();
+        ui.set_delete_data_open(false);
+        ui.set_delete_data_confirmation("".into());
+        self.sync();
+        self.position_terminals();
+        self.status("All saved servers and passwords deleted. All sessions closed.");
+        Ok(())
     }
 
     fn position_terminals(&mut self) {
@@ -316,6 +501,7 @@ impl Controller {
     }
 
     fn lock(&mut self) {
+        self.close_settings();
         self.dismiss_popups();
         self.dismiss_close_confirmation();
         for tab in &mut self.tabs {
@@ -363,6 +549,7 @@ impl Controller {
             return Err("Unlock the vault first.".into());
         }
         self.reset_editor();
+        self.close_settings();
         self.dismiss_popups();
         let ui = self.ui.upgrade().ok_or("Workspace closed.")?;
         ui.set_drawer_open(false);
@@ -555,6 +742,7 @@ impl Controller {
         });
         let index = self.tabs.len() - 1;
         self.active = Some(index);
+        self.close_settings();
         self.dismiss_popups();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_editor_open(false);
@@ -602,7 +790,36 @@ impl Controller {
         )?;
         self.selected = Some(index);
         self.open_tab(host.name, Some(session))?;
+        if let Err(error) = self.remember_server_use(index) {
+            self.status(&format!(
+                "Session opened, but the recent server order could not be saved: {error}"
+            ));
+            return Ok(());
+        }
         self.status("Connecting. Verify any new host fingerprint using a trusted source.");
+        Ok(())
+    }
+
+    // The encrypted inventory order is the MRU order, avoiding a separate usage-history file.
+    fn remember_server_use(&mut self, index: usize) -> Result<()> {
+        let vault = self.vault.as_ref().ok_or("Unlock the vault first.")?;
+        if index >= self.hosts.len() {
+            return Err("Server no longer exists.".into());
+        }
+        if index != 0 {
+            let mut next = self.hosts.clone();
+            let host = next.remove(index);
+            next.insert(0, host);
+            let sealed = vault.seal(&next)?;
+            self.store.write(&sealed)?;
+            self.envelope = Some(sealed);
+            self.hosts = next;
+        }
+        self.selected = Some(0);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_server_scroll_y(0.);
+        }
+        self.sync();
         Ok(())
     }
 
@@ -616,6 +833,7 @@ impl Controller {
             .ok_or("Session no longer exists.")?
             .terminal;
         self.active = Some(index);
+        self.close_settings();
         self.dismiss_popups();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_editor_open(false);
@@ -747,7 +965,11 @@ impl Controller {
             return Ok(());
         }
         self.dismiss_popups();
-        if self.vault.is_some() && !ui.get_editor_open() && !ui.get_about_open() {
+        if self.vault.is_some()
+            && !ui.get_editor_open()
+            && !ui.get_about_open()
+            && !ui.get_settings_open()
+        {
             let terminal = self
                 .active
                 .and_then(|index| self.tabs.get(index))
@@ -781,24 +1003,30 @@ impl Controller {
         if self.vault.is_none() {
             return Err("Unlock the vault first.".into());
         }
-        let actions = [
-            ReadOnlyAction::System,
-            ReadOnlyAction::Uptime,
-            ReadOnlyAction::Disk,
-            ReadOnlyAction::Memory,
-        ];
-        let action = actions.get(index).ok_or("Unknown command shortcut.")?;
+        let vault = self.vault.as_ref().unwrap();
+        let command = if let Some((_, command)) = BUILTIN_SHORTCUTS.get(index) {
+            (*command).to_string()
+        } else {
+            vault
+                .shortcuts
+                .get(index - BUILTIN_SHORTCUTS.len())
+                .ok_or("Unknown command shortcut.")?
+                .command
+                .clone()
+        };
         let tab = self
             .active
             .and_then(|i| self.tabs.get(i))
             .filter(|tab| tab.session.is_some())
             .ok_or("Choose a running session first.")?;
         let terminal = tab.terminal;
+        self.close_settings();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_editor_open(false);
+            ui.set_about_open(false);
         }
         self.position_terminals();
-        terminal_view::insert_command(terminal, action.command())?;
+        terminal_view::insert_command(terminal, &command)?;
         // SAFETY: the selected terminal is visible and attached to its own running session.
         unsafe {
             SetFocus(terminal);
@@ -1087,11 +1315,59 @@ fn wire(ui: &Workspace, controller: &Rc<RefCell<Controller>>) {
     ui.on_open_about(move || {
         perform(&state, |state| {
             state.dismiss_popups();
+            state.close_settings();
+            state.reset_editor();
             let ui = state.ui.upgrade().ok_or("Workspace closed.")?;
+            ui.set_editor_open(false);
             ui.set_about_open(true);
             state.position_terminals();
             Ok(())
         })
+    });
+    let state = controller.clone();
+    ui.on_open_settings(move || perform(&state, Controller::open_settings));
+    let state = controller.clone();
+    ui.on_close_settings(move || {
+        perform(&state, |state| {
+            state.close_settings();
+            state.position_terminals();
+            state.focus_terminal();
+            Ok(())
+        })
+    });
+    let state = controller.clone();
+    ui.on_copy_database_location(move || {
+        perform(&state, |state| {
+            if state.vault.is_none() {
+                return Err("Unlock the vault first.".into());
+            }
+            terminal_view::set_clipboard_text(
+                state.window,
+                &state.paths.database_dir.join("vault.edb").to_string_lossy(),
+            )?;
+            state.status("Database location copied to the clipboard.");
+            Ok(())
+        })
+    });
+    let state = controller.clone();
+    ui.on_change_vault_key(move || perform(&state, Controller::change_vault_key));
+    let state = controller.clone();
+    ui.on_delete_all_server_data(move || perform(&state, Controller::delete_all_server_data));
+    let state = controller.clone();
+    ui.on_new_shortcut(move || {
+        perform(&state, |state| {
+            state.open_settings()?;
+            let ui = state.ui.upgrade().ok_or("Workspace closed.")?;
+            ui.set_shortcut_editor_open(true);
+            ui.invoke_reset_settings_scroll();
+            Ok(())
+        })
+    });
+    let state = controller.clone();
+    ui.on_save_shortcut(move || perform(&state, Controller::save_shortcut));
+    let state = controller.clone();
+    ui.on_delete_shortcut(move |index| {
+        perform(&state, |state| state.delete_shortcut(index as usize))
     });
     let state = controller.clone();
     ui.on_close_about(move || {
@@ -1134,14 +1410,18 @@ fn wire(ui: &Workspace, controller: &Rc<RefCell<Controller>>) {
     let state = controller.clone();
     ui.on_open_shortcuts(move || {
         perform(&state, |state| {
+            if state.vault.is_none() {
+                return Err("Unlock the vault first.".into());
+            }
             state.dismiss_popups();
-            let tab = state
-                .active
-                .and_then(|index| state.tabs.get(index))
-                .ok_or("Choose a running session first.")?;
-            let image = slint::Image::from_rgba8(terminal_pixels(tab.terminal)?);
             if let Some(ui) = state.ui.upgrade() {
-                ui.set_terminal_image(image);
+                if ui.get_terminal_visible() {
+                    let terminal = state
+                        .active
+                        .and_then(|index| state.tabs.get(index))
+                        .map_or(state.empty_terminal, |tab| tab.terminal);
+                    ui.set_terminal_image(slint::Image::from_rgba8(terminal_pixels(terminal)?));
+                }
                 ui.set_shortcuts_open(true);
             }
             state.position_terminals();
@@ -1366,8 +1646,17 @@ fn navigation_smoke_test(
         }
         verify_terminal_layout(ui, &controller.borrow())?;
         preview_snapshot(ui, &controller.borrow(), "slint-server-drawer")?;
-        ui.invoke_toggle_servers();
+        server_list_smoke_test(ui, controller)?;
+        // Editing during the overflow check closes the drawer; let its restored layout settle.
         phase.step = 2;
+        return Ok(false);
+    }
+    if phase.step == 2 {
+        if !ui.get_drawer_open() {
+            return Err("The overflow check did not restore the server drawer.".into());
+        }
+        ui.invoke_toggle_servers();
+        phase.step = 3;
         return Ok(false);
     }
     if ui.get_drawer_open() || (ui.get_terminal_width() - phase.full_width).abs() > 1. {
@@ -1442,6 +1731,120 @@ fn navigation_smoke_test(
     }
     verify_terminal_layout(ui, &controller.borrow())?;
     Ok(true)
+}
+
+fn server_list_smoke_test(ui: &Workspace, controller: &Rc<RefCell<Controller>>) -> Result<()> {
+    let (original_hosts, original_envelope, original_selected) = {
+        let state = controller.borrow();
+        (state.hosts.clone(), state.envelope.clone(), state.selected)
+    };
+    {
+        let mut state = controller.borrow_mut();
+        for index in 1..=27 {
+            state.hosts.push(Host {
+                name: format!("Overflow server {index}"),
+                address: format!("overflow-{index}.example.test"),
+                port: 22,
+                username: "deploy".into(),
+                identity_path: String::new(),
+                authentication: Authentication::Key,
+                password: None,
+            });
+        }
+        state.sync();
+    }
+    ui.set_server_scroll_y(0.);
+    preview_snapshot(ui, &controller.borrow(), "slint-server-overflow-top")?;
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(150., ui.get_terminal_y() + 150.),
+            delta_x: 0.,
+            delta_y: -400.,
+        });
+    if ui.get_server_scroll_y() >= 0. {
+        return Err("The overflowing server list did not respond to the mouse wheel.".into());
+    }
+    let list_height = ui.get_terminal_height() - 117.;
+    ui.set_server_scroll_y(-(30. * 116. - list_height));
+    preview_snapshot(ui, &controller.borrow(), "slint-server-overflow-bottom")?;
+    let position = slint::LogicalPosition::new(220., ui.get_terminal_y() + 49. + list_height - 36.);
+    for event in [
+        slint::platform::WindowEvent::PointerPressed {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        },
+        slint::platform::WindowEvent::PointerReleased {
+            position,
+            button: slint::platform::PointerEventButton::Left,
+        },
+    ] {
+        ui.window().dispatch_event(event);
+    }
+    if !ui.get_editor_open()
+        || ui.get_server_name() != "Overflow server 27"
+        || controller.borrow().selected != Some(29)
+    {
+        return Err(
+            "The last server's Edit button did not work after scrolling to the bottom.".into(),
+        );
+    }
+    ui.invoke_close_editor();
+    {
+        let mut state = controller.borrow_mut();
+        state.remember_server_use(2)?;
+        state.remember_server_use(2)?;
+        if state
+            .hosts
+            .iter()
+            .take(3)
+            .map(|host| host.name.as_str())
+            .collect::<Vec<_>>()
+            != ["Production", "Staging", "Home server"]
+            || state.selected != Some(0)
+            || ui.get_server_scroll_y() != 0.
+        {
+            return Err(
+                "Recently used servers did not move to the top in connection order.".into(),
+            );
+        }
+        let sealed = state
+            .store
+            .read()?
+            .ok_or("Recent server order was not saved.")?;
+        let (_, reopened) = UnlockedVault::unlock(
+            &Secret(b"disposable Slint preview vault passphrase".to_vec()),
+            &sealed,
+        )?;
+        if reopened != state.hosts {
+            return Err("Recent server order did not survive reading the saved vault.".into());
+        }
+        if state.remember_server_use(usize::MAX).is_ok()
+            || state.store.read()?.as_ref() != Some(&sealed)
+        {
+            return Err("An invalid server index changed the recent server order.".into());
+        }
+    }
+    ui.invoke_edit_server(0);
+    if ui.get_server_name() != "Production" {
+        return Err("Server editing no longer matches the reordered list.".into());
+    }
+    ui.invoke_close_editor();
+    {
+        let mut state = controller.borrow_mut();
+        state.hosts = original_hosts;
+        state.store.write(
+            original_envelope
+                .as_ref()
+                .ok_or("Preview inventory missing.")?,
+        )?;
+        state.envelope = original_envelope;
+        state.selected = original_selected;
+        state.reset_editor();
+        state.sync();
+    }
+    ui.set_drawer_open(true);
+    ui.set_server_scroll_y(0.);
+    Ok(())
 }
 
 fn smoke_test(ui: &Workspace, controller: &Rc<RefCell<Controller>>) -> Result<()> {
@@ -1628,6 +2031,197 @@ fn smoke_test(ui: &Workspace, controller: &Rc<RefCell<Controller>>) -> Result<()
         return Err("Unlock did not restore the visible terminal.".into());
     }
     preview_snapshot(ui, &controller.borrow(), "slint-preview")?;
+    settings_smoke_test(ui, controller)?;
+    Ok(())
+}
+
+fn settings_smoke_test(ui: &Workspace, controller: &Rc<RefCell<Controller>>) -> Result<()> {
+    ui.invoke_open_settings();
+    if !ui.get_settings_open()
+        || ui.get_terminal_visible()
+        || controller
+            .borrow()
+            .tabs
+            .iter()
+            .any(|tab| tab.shown || tab.input_attached)
+        || ui.get_database_location().as_str()
+            != controller
+                .borrow()
+                .paths
+                .database_dir
+                .join("vault.edb")
+                .to_string_lossy()
+    {
+        return Err(
+            "Settings did not show the database location and hide the native terminal.".into(),
+        );
+    }
+    preview_snapshot(ui, &controller.borrow(), "slint-settings")?;
+    // Shortcut management remains available without a running SSH connection.
+    ui.invoke_open_shortcuts();
+    if !ui.get_shortcuts_open() {
+        return Err("Shortcuts cannot be managed without a running session.".into());
+    }
+    ui.invoke_new_shortcut();
+    if !ui.get_shortcut_editor_open() || ui.get_shortcuts_open() {
+        return Err("New shortcut did not open its settings form.".into());
+    }
+    ui.set_shortcut_name("Container logs".into());
+    ui.set_shortcut_command("docker logs --tail 30 app\nreboot".into());
+    let original = controller.borrow().envelope.clone();
+    ui.invoke_save_shortcut();
+    if controller.borrow().envelope != original || !ui.get_shortcut_editor_open() {
+        return Err("An unsafe multiline shortcut changed the vault.".into());
+    }
+    ui.set_shortcut_command("docker logs --tail 30 app".into());
+    preview_snapshot(ui, &controller.borrow(), "slint-new-shortcut")?;
+    ui.invoke_save_shortcut();
+    if ui.get_shortcut_editor_open()
+        || !ui.get_shortcut_command().is_empty()
+        || controller.borrow().vault.as_ref().unwrap().shortcuts.len() != 1
+    {
+        return Err("Custom shortcut was not saved and cleared from the form.".into());
+    }
+    ui.invoke_new_shortcut();
+    ui.set_shortcut_name("container logs".into());
+    ui.set_shortcut_command("uptime".into());
+    let original = controller.borrow().envelope.clone();
+    ui.invoke_save_shortcut();
+    if controller.borrow().envelope != original {
+        return Err("A duplicate shortcut overwrote the saved inventory.".into());
+    }
+    ui.set_current_passphrase("incorrect current passphrase".into());
+    ui.set_new_passphrase("replacement smoke-test master passphrase".into());
+    ui.set_new_passphrase_confirmation("replacement smoke-test master passphrase".into());
+    ui.invoke_change_vault_key();
+    if controller.borrow().envelope != original
+        || !ui.get_current_passphrase().is_empty()
+        || !ui.get_new_passphrase().is_empty()
+        || !ui.get_new_passphrase_confirmation().is_empty()
+    {
+        return Err(
+            "A wrong current passphrase changed the vault or left secret inputs populated.".into(),
+        );
+    }
+    // Reset only the disposable fixture's retry deadline to exercise further validation immediately.
+    controller.borrow_mut().retry_after = Instant::now();
+    ui.set_current_passphrase("disposable Slint preview vault passphrase".into());
+    ui.set_new_passphrase("replacement smoke-test master passphrase".into());
+    ui.set_new_passphrase_confirmation("mismatched confirmation".into());
+    ui.invoke_change_vault_key();
+    if controller.borrow().envelope != original {
+        return Err("Mismatched replacement passphrases changed the saved vault.".into());
+    }
+    ui.set_current_passphrase("disposable Slint preview vault passphrase".into());
+    ui.set_new_passphrase("replacement smoke-test master passphrase".into());
+    ui.set_new_passphrase_confirmation("replacement smoke-test master passphrase".into());
+    ui.invoke_change_vault_key();
+    {
+        let state = controller.borrow();
+        let sealed = state
+            .store
+            .read()?
+            .ok_or("Settings did not persist the vault.")?;
+        if UnlockedVault::unlock(
+            &Secret(b"disposable Slint preview vault passphrase".to_vec()),
+            &sealed,
+        )
+        .is_ok()
+        {
+            return Err("The old passphrase still unlocks the updated vault.".into());
+        }
+        let (vault, hosts) = UnlockedVault::unlock(
+            &Secret(b"replacement smoke-test master passphrase".to_vec()),
+            &sealed,
+        )?;
+        if vault.shortcuts.len() != 1
+            || hosts != state.hosts
+            || vault
+                .decrypt_password(
+                    hosts[0]
+                        .password
+                        .as_ref()
+                        .ok_or("Password lost during key change.")?,
+                )?
+                .0
+                != b"disposable smoke-test SSH password"
+        {
+            return Err("Changing the vault key lost a server, password, or shortcut.".into());
+        }
+    }
+    ui.set_current_passphrase("clear this on lock".into());
+    ui.set_new_passphrase("clear this on lock too".into());
+    ui.set_delete_data_open(true);
+    ui.set_delete_data_confirmation("DELETE".into());
+    ui.invoke_lock();
+    if ui.get_settings_open()
+        || ui.get_shortcut_editor_open()
+        || ui.get_delete_data_open()
+        || !ui.get_current_passphrase().is_empty()
+        || !ui.get_new_passphrase().is_empty()
+        || !ui.get_delete_data_confirmation().is_empty()
+        || !ui.get_shortcut_command().is_empty()
+    {
+        return Err("Locking did not clear settings and pending destructive actions.".into());
+    }
+    let original = controller.borrow().envelope.clone();
+    ui.invoke_delete_all_server_data();
+    if controller.borrow().envelope != original {
+        return Err("A stale delete callback changed the locked vault.".into());
+    }
+    ui.set_master("replacement smoke-test master passphrase".into());
+    ui.invoke_unlock();
+    if !ui.get_unlocked() || controller.borrow().vault.as_ref().unwrap().shortcuts.len() != 1 {
+        return Err("Unlocking did not restore the updated vault and its shortcut.".into());
+    }
+    ui.invoke_open_settings();
+    let original = controller.borrow().envelope.clone();
+    ui.invoke_delete_all_server_data();
+    if controller.borrow().envelope != original {
+        return Err("Unconfirmed bulk deletion changed the saved servers.".into());
+    }
+    ui.set_delete_data_open(true);
+    ui.set_delete_data_confirmation("DELETE".into());
+    ui.invoke_delete_all_server_data();
+    {
+        let state = controller.borrow();
+        let sealed = state
+            .store
+            .read()?
+            .ok_or("Deleted inventory was not saved.")?;
+        let (vault, hosts) = UnlockedVault::unlock(
+            &Secret(b"replacement smoke-test master passphrase".to_vec()),
+            &sealed,
+        )?;
+        if !hosts.is_empty()
+            || !state.hosts.is_empty()
+            || !state.tabs.is_empty()
+            || state.active.is_some()
+            || ui.get_delete_data_open()
+            || vault.shortcuts.len() != 1
+        {
+            return Err(
+                "Bulk deletion left servers or session tabs, or removed custom shortcuts.".into(),
+            );
+        }
+    }
+    ui.invoke_delete_shortcut(0);
+    if controller.borrow().vault.as_ref().unwrap().shortcuts.len() != 1 {
+        return Err("Built-in shortcut removal changed custom shortcuts.".into());
+    }
+    ui.invoke_delete_shortcut(BUILTIN_SHORTCUTS.len() as i32);
+    if !controller
+        .borrow()
+        .vault
+        .as_ref()
+        .unwrap()
+        .shortcuts
+        .is_empty()
+    {
+        return Err("Removing a custom shortcut did not persist.".into());
+    }
+    ui.invoke_close_settings();
+    verify_terminal_layout(ui, &controller.borrow())?;
     Ok(())
 }
 

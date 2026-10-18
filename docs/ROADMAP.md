@@ -1,6 +1,6 @@
 # Rust implementation checklist
 
-Updated: 13 October 2026. The full scope remains in [the engineering plan](../secure_ssh_server_manager_project_plan.md).
+Updated: 17 October 2026. The full scope remains in [the engineering plan](../secure_ssh_server_manager_project_plan.md).
 
 ## Implemented preview
 
@@ -14,6 +14,10 @@ Updated: 13 October 2026. The full scope remains in [the engineering plan](../se
 - [x] Saved-password login with separate vault-key encryption, on-demand decryption, and single-use private askpass handoff.
 - [x] Legacy inventory upgrade, encrypted-password edit/reopen tests, helper delivery/cancellation and caller validation.
 - [x] System/uptime/disk/memory shortcuts dropdown that inserts commands into the active terminal for editing and explicit Enter to run.
+- [x] Persistent recently connected server order and overflow-tested server drawer with a fixed New server button.
+- [x] Expanded 28-command Linux/DevOps catalog covering diagnostics, networking, services/logs, Docker/Compose, and Kubernetes.
+- [x] Settings with database location, verified master-passphrase changes, and confirmed deletion of all saved servers/passwords and session tabs.
+- [x] Custom single-line command shortcuts stored in the encrypted workspace, with add/remove controls and legacy inventory decoding.
 - [x] Wrong-password, tamper, invalid-input, native UI, encrypted-artifact, and crash-recovery tests.
 - [x] Dark resizable workspace, server-card Connect/Edit controls, and a separate server editor.
 - [x] Slint Windows frontend with hover/press/focus animations, native terminal hosting, dark scrollbars, and disposable UI preview/smoke tests.
@@ -36,7 +40,8 @@ Updated: 13 October 2026. The full scope remains in [the engineering plan](../se
 ## Complete the first shipping slice
 
 - [ ] Portable authenticated encrypted backup/restore and recovery tests.
-- [ ] Passphrase change, schema/KDF upgrades, and account/device migration.
+- [x] Master-passphrase change with current-passphrase verification and durable replacement while preserving saved passwords.
+- [ ] KDF upgrades and account/device migration.
 - [x] Generate Ed25519 OpenSSH key pairs from the server editor, save private files with per-user ACLs, and display/copy the public key. Optional passphrases encrypt generated files; the vault stores the identity path.
 - [ ] Import keys into the encrypted vault, inspect public fingerprints, rotate, export.
 - [ ] Define agent lifetime/signing revocation behavior on lock.
