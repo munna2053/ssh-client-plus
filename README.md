@@ -2,6 +2,10 @@
 
 A Windows-native SSH manager written in Rust. This is an internal preview of the first development slice in [the project plan](secure_ssh_server_manager_project_plan.md).
 
+[Download Windows releases](https://github.com/munna2053/ssh-client-plus/releases) · [Release workflow](https://github.com/munna2053/ssh-client-plus/actions/workflows/release.yml)
+
+Published releases include a portable Windows x64 ZIP and SHA-256 checksum. Extract the ZIP and run `sentinel-ssh.exe`; Rust and build tools are not needed. For publishing instructions, see [the release guide](docs/RELEASING.md). Pushing a version tag such as `v0.1.0` builds, checks, packages, and publishes that version on GitHub.
+
 ## Current features
 
 - Compact Slint workspace with session tabs, an animated server drawer, a Notepad-style application menu, animated buttons, and keyboard-focus feedback.

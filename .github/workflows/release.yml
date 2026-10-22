@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and check Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      # Keep the MSVC runtime in the executable; explicitly target builds so host
+      # procedural macros are not built with this target-only flag.
+      RUSTFLAGS: -C target-feature=+crt-static
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      asset: ${{ steps.version.outputs.asset }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.90.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt --component clippy
+
+      - name: Validate release version
+        id: version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the Cargo package version.' }
+          $package = $metadata.packages | Where-Object { $_.name -eq 'sentinel-ssh' }
+          $version = $package.version
+          $tag = "v$version"
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne $tag) {
+            throw "Tag '$env:GITHUB_REF_NAME' must match Cargo.toml version '$tag'."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          $prerelease = ($version -split '\+', 2)[0].Contains('-')
+          "prerelease=$($prerelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "asset=sentinel-ssh-$version-windows-x64.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc -- --test-threads=1
+
+      - name: Build release executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Check the release UI with disposable data
+        timeout-minutes: 3
+        run: |
+          $executable = Join-Path $env:GITHUB_WORKSPACE 'target\x86_64-pc-windows-msvc\release\sentinel-ssh.exe'
+          $stderr = Join-Path $env:RUNNER_TEMP 'sentinel-release-smoke.stderr.txt'
+          $process = Start-Process -FilePath $executable -ArgumentList '--ui-smoke-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardError $stderr
+          Get-Content -LiteralPath $stderr
+          if ($process.ExitCode -ne 0) { throw "Release UI smoke test failed: $($process.ExitCode)" }
+
+      - name: Package ZIP and checksum
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/package-release.ps1 -Version $env:RELEASE_VERSION
+
+      - name: Save build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64-release
+          path: |
+            target/release-assets/*.zip
+            target/release-assets/*.sha256
+            target/release-assets/RELEASE_NOTES.md
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download checked release artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-x64-release
+          path: release-assets
+
+      - name: Verify download checksum
+        env:
+          RELEASE_ASSET: ${{ needs.build.outputs.asset }}
+        working-directory: release-assets
+        run: sha256sum --check "$RELEASE_ASSET.sha256"
+
+      - name: Create release with downloadable assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          RELEASE_ASSET: ${{ needs.build.outputs.asset }}
+        run: |
+          flags=()
+          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" \
+            "release-assets/$RELEASE_ASSET" \
+            "release-assets/$RELEASE_ASSET.sha256" \
+            --verify-tag \
+            --title "SentinelSSH $RELEASE_TAG" \
+            --generate-notes \
+            --notes-file release-assets/RELEASE_NOTES.md \
+            "${flags[@]}"
