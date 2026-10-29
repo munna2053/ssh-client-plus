@@ -92,6 +92,7 @@ struct State {
     selected: Option<usize>,
     controls: Vec<(usize, HWND)>,
     last_activity: Instant,
+    idle_lock: Duration,
     retry_after: Instant,
     failures: u32,
     tabs: Vec<SessionTab>,
@@ -115,6 +116,7 @@ impl State {
             selected: None,
             controls: vec![],
             last_activity: Instant::now(),
+            idle_lock: Duration::from_secs(600),
             retry_after: Instant::now(),
             failures: 0,
             tabs: vec![],
@@ -1609,7 +1611,7 @@ impl State {
     }
 
     fn tick(&mut self) {
-        if self.vault.is_some() && self.last_activity.elapsed() >= Duration::from_secs(600) {
+        if self.vault.is_some() && self.last_activity.elapsed() >= self.idle_lock {
             self.lock();
         }
         let mut changed = false;
@@ -2564,9 +2566,11 @@ mod tests {
                     !String::from_utf8_lossy(state.envelope.as_ref().unwrap())
                         .contains("confidential-test-name")
                 );
-                state.last_activity = Instant::now() - Duration::from_secs(601);
+                // Instant counts from boot, so backdating it can underflow on a freshly started CI machine.
+                state.idle_lock = Duration::ZERO;
                 state.set(SERVER_PASSWORD, "unsaved password draft");
                 state.tick();
+                state.idle_lock = Duration::from_secs(600);
                 assert!(state.hosts.is_empty());
                 assert!(state.vault.is_none());
                 assert!(state.text(SERVER_PASSWORD).is_empty());
