@@ -22,9 +22,9 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    System::RemoteDesktop::*,
+    System::{LibraryLoader::GetModuleHandleW, RemoteDesktop::*},
     UI::{
-        HiDpi::GetDpiForWindow,
+        HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
         Input::KeyboardAndMouse::SetFocus,
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::*,
@@ -2281,6 +2281,19 @@ fn start_runtime(
             std::ptr::from_ref(&dark).cast(),
             std::mem::size_of_val(&dark) as u32,
         );
+    }
+    // SAFETY: the icon group is embedded in this executable by build.rs; shared icons need no destruction.
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        let dpi = GetDpiForWindow(window).max(96);
+        for (kind, metric) in [(ICON_BIG, SM_CXICON), (ICON_SMALL, SM_CXSMICON)] {
+            let size = GetSystemMetricsForDpi(metric, dpi);
+            // MAKEINTRESOURCE(1): the RT_GROUP_ICON ID written by build.rs.
+            let icon = LoadImageW(module, 1 as _, IMAGE_ICON, size, size, LR_SHARED);
+            if !icon.is_null() {
+                SendMessageW(window, WM_SETICON, kind as WPARAM, icon as LPARAM);
+            }
+        }
     }
     let preview = smoke || std::env::args().any(|argument| argument == "--ui-preview");
     let paths = if preview {

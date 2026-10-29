@@ -136,6 +136,8 @@ src/windows/terminal_view.rs native terminal rendering, keyboard and clipboard
 src/windows/theme.rs   dark workspace colours and DPI-scaled fonts
 src/windows/askpass.rs  single-use private credential pipe and OpenSSH helper mode
 src/windows/keygen.rs   background OpenSSH key generation and public-key loading
+assets/icon/           application icon SVG sources and the generated multi-size .ico
+build.rs               embeds the .ico in the executable as a Windows icon resource
 ```
 
 License: MIT.

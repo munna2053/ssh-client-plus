@@ -31,6 +31,16 @@ Versions such as `0.2.0-rc.1` must appear in both Cargo files and use a matching
 
 Publishing runs only after the build job succeeds. A failed build publishes nothing. Fix build failures on a new commit and use a new version/tag; do not move published tags. If a run failed only during publication and no release was created, re-run its failed jobs. An existing release is not overwritten by the workflow.
 
+## Application icon
+
+`build.rs` embeds `assets/icon/sentinel-ssh.ico` in the executable for Explorer, the taskbar, and the window title bar. The `.ico` is committed, so builds need no image tools. After editing `sentinel-ssh.svg` (32 px and larger) or `sentinel-ssh-small.svg` (16–24 px), regenerate it with GIMP 3:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-icon.ps1
+```
+
+Pass `-PreviewDirectory <folder>` to also save a PNG of each size for review.
+
 ## Package locally
 
 After a normal MSVC release build:
