@@ -26,7 +26,7 @@ The pinned Winit 0.30 integration hook creates opaque native windows. Slint's de
 
 `scripts/check-terminal-opacity.ps1` checks the displayed terminal over an owned white test window in disposable preview mode. It compares one composited screen pixel inside the terminal with the terminal's painted pixel, catching transparency that the application-rendered preview snapshots cannot detect. It requires an interactive Windows desktop and records no screenshot.
 
-`--ui-preview` uses a disposable workspace in `.scratch`, sample hosts, and sample terminal output. It does not load the user's vault or connect to the sample hosts. `--ui-smoke-test` additionally runs callback, encryption, password clearing, session selection/closing, and workstation lock/unlock checks before exiting. The integration test launches this mode in a separate process so Winit runs on that process's main thread.
+`--ui-preview` uses a new disposable workspace in `%TEMP%\SentinelSSH-preview-*`, sample hosts, and sample terminal output. It does not load the user's vault or connect to the sample hosts. `--ui-smoke-test` additionally runs callback, encryption, password clearing, session selection/closing, and workstation lock/unlock checks before exiting. It saves BMP snapshots in that workspace and prints its location to standard error. The integration test launches this mode in a separate process so Winit runs on that process's main thread.
 
 The portable GNU/LLVM build uses a small project-local linker wrapper for Rust procedural-macro DLLs. It normalizes generated response/definition line endings, chooses the x64 DLL CRT entry point, and invokes LLVM directly. It is build tooling and is not required to run the application.
 

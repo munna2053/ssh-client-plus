@@ -1499,9 +1499,13 @@ fn wire(ui: &Workspace, controller: &Rc<RefCell<Controller>>) {
 }
 
 fn preview_paths() -> Result<AppPaths> {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(".scratch")
-        .join(format!("slint-preview-{}", std::process::id()));
+    // A new random directory under the user's temporary folder keeps disposable preview data away
+    // from the real vault and from the build machine's source path compiled into the executable.
+    let nonce = super::crypto::random::<16>()?;
+    let name: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    let root = std::env::temp_dir().join(format!("SentinelSSH-preview-{name}"));
+    std::fs::create_dir(&root)
+        .map_err(|error| format!("Cannot create the preview workspace: {error}"))?;
     super::paths::secure_directory(&root)?;
     let database_dir = root.join("database");
     super::paths::secure_directory(&database_dir)?;
@@ -1552,11 +1556,8 @@ fn preview_snapshot(ui: &Workspace, state: &Controller, name: &str) -> Result<()
     for pixel in pixels.as_slice() {
         bytes.extend_from_slice(&[pixel.b, pixel.g, pixel.r, 255]);
     }
-    std::fs::write(
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(".scratch/{name}.bmp")),
-        bytes,
-    )
-    .map_err(|error| error.to_string())
+    std::fs::write(state.paths.root.join(format!("{name}.bmp")), bytes)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Default)]
@@ -2282,16 +2283,16 @@ fn start_runtime(
         );
     }
     let preview = smoke || std::env::args().any(|argument| argument == "--ui-preview");
-    let controller = Rc::new(RefCell::new(Controller::new(
-        ui,
-        window,
-        if preview {
-            preview_paths()?
-        } else {
-            AppPaths::discover()?
-        },
-        preview,
-    )?));
+    let paths = if preview {
+        preview_paths()?
+    } else {
+        AppPaths::discover()?
+    };
+    if smoke {
+        // Tells developers where to review the smoke test's BMP snapshots.
+        eprintln!("Preview workspace: {}", paths.root.display());
+    }
+    let controller = Rc::new(RefCell::new(Controller::new(ui, window, paths, preview)?));
     wire(ui, &controller);
     {
         let mut state = controller.borrow_mut();

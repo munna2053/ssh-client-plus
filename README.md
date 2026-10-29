@@ -37,7 +37,7 @@ To review the UI with disposable sample servers and terminal output:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Action run -Portable -Offline -Preview
 ```
 
-Preview mode uses a temporary workspace in `.scratch` and does not load your real vault or connect to the sample hosts. The frontend uses Slint 1.13.1, pinned for compatibility with the Rust toolchain. Its About screen includes Slint's attribution widget. See [the Slint frontend decision](docs/ADR-002-slint-windows-frontend.md).
+Preview mode uses a new disposable workspace in your Windows temporary folder (`%TEMP%\SentinelSSH-preview-*`) and does not load your real vault or connect to the sample hosts. The frontend uses Slint 1.13.1, pinned for compatibility with the Rust toolchain. Its About screen includes Slint's attribution widget. See [the Slint frontend decision](docs/ADR-002-slint-windows-frontend.md).
 
 For a fresh developer machine, install [Rust](https://rust-lang.org/install.html) with the MSVC toolchain and the [MSVC build tools and Windows SDK](https://rust-lang.github.io/rustup/installation/windows-msvc.html). The repository pins Rust 1.90.0 and Microsoft's `windows-sys` 0.61.2 API bindings. Then:
 

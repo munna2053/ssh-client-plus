@@ -117,16 +117,19 @@ impl View {
                     break;
                 }
             }
-            self.scroll = 0;
-            self.selection = None;
-            // SAFETY: activity carries no pointer or secret and does not synchronously reenter the parent.
-            unsafe {
-                PostMessageW(GetParent(window), ACTIVITY, 0, 0);
-                InvalidateRect(window, null(), 0);
-            }
+            self.input_sent(window);
         }
         // Clear this owned staging buffer as well as packets cleared by the writer.
         drop(Secret(bytes));
+    }
+    fn input_sent(&mut self, window: HWND) {
+        self.scroll = 0;
+        self.selection = None;
+        // SAFETY: activity carries no pointer or secret and does not synchronously reenter the parent.
+        unsafe {
+            PostMessageW(GetParent(window), ACTIVITY, 0, 0);
+            InvalidateRect(window, null(), 0);
+        }
     }
     fn point(&self, parameter: LPARAM) -> (usize, usize) {
         let pad = theme::scale(PADDING, self.dpi);
@@ -287,26 +290,15 @@ impl View {
         }
     }
     fn paste(&mut self, window: HWND) {
-        let Ok(mut text) = clipboard_text(window) else {
+        let Ok(text) = clipboard_text(window) else {
             return;
         };
-        let mut previous_cr = false;
-        text.0.retain_mut(|byte| {
-            let skip = *byte == b'\n' && previous_cr;
-            previous_cr = *byte == b'\r';
-            if *byte == b'\n' {
-                *byte = b'\r';
-            }
-            !skip
-        });
-        if self.model.bracketed_paste {
-            let mut framed = Secret(vec![0; text.0.len() + 12]);
-            framed.0[..6].copy_from_slice(b"\x1b[200~");
-            framed.0[6..6 + text.0.len()].copy_from_slice(&text.0);
-            framed.0[6 + text.0.len()..].copy_from_slice(b"\x1b[201~");
-            self.send(window, std::mem::take(&mut framed.0));
-        } else {
-            self.send(window, std::mem::take(&mut text.0));
+        let packet = paste_packet(text, self.model.bracketed_paste);
+        // One packet is queued whole or not at all, so backpressure cannot drop a closing delimiter.
+        if let Some(input) = &self.input
+            && input.try_send(packet).is_ok()
+        {
+            self.input_sent(window);
         }
     }
     fn copy(&self, window: HWND) {
@@ -748,6 +740,54 @@ fn clipboard_text(window: HWND) -> Result<Secret> {
         Ok(text)
     }
 }
+// Clipboard text may come from an attacker, so only printable text, tabs, and line breaks are sent.
+// Removing every C0/C1 control keeps it from ending a bracketed paste early or forging keystrokes.
+fn paste_packet(mut text: Secret, bracketed: bool) -> Secret {
+    let bytes = &mut text.0;
+    let mut kept = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        let output = match byte {
+            b'\r' => {
+                if bytes.get(index) == Some(&b'\n') {
+                    index += 1;
+                }
+                Some(b'\r')
+            }
+            b'\n' => Some(b'\r'),
+            b'\t' => Some(b'\t'),
+            0..=0x1f | 0x7f => None,
+            // UTF-8 encodes the C1 controls U+0080..U+009F, including single-character CSI, as C2 80..9F.
+            0xc2 if bytes
+                .get(index)
+                .is_some_and(|next| (0x80..=0x9f).contains(next)) =>
+            {
+                index += 1;
+                None
+            }
+            _ => Some(byte),
+        };
+        if let Some(output) = output {
+            bytes[kept] = output;
+            kept += 1;
+        }
+    }
+    for byte in &mut bytes[kept..] {
+        // SAFETY: byte is a valid exclusive reference; Secret clears only the bytes kept below.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    bytes.truncate(kept);
+    if !bracketed {
+        return text;
+    }
+    let mut framed = Secret(Vec::with_capacity(text.0.len() + 12));
+    framed.0.extend_from_slice(b"\x1b[200~");
+    framed.0.extend_from_slice(&text.0);
+    framed.0.extend_from_slice(b"\x1b[201~");
+    framed
+}
 pub(crate) fn set_clipboard_text(window: HWND, text: &str) -> Result<()> {
     let text = wide(text);
     // SAFETY: clipboard opened on its owning UI thread and closed by the guard.
@@ -780,6 +820,35 @@ pub(crate) fn set_clipboard_text(window: HWND, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_cannot_end_bracketed_paste_or_inject_controls() {
+        let packet = |text: &str, bracketed| {
+            std::mem::take(&mut paste_packet(Secret(text.into()), bracketed).0)
+        };
+        // The assessment's payload: an embedded end delimiter followed by a command line.
+        assert_eq!(
+            packet("echo harmless\x1b[201~\necho AUDIT_MARKER\n", true),
+            b"\x1b[200~echo harmless[201~\recho AUDIT_MARKER\r\x1b[201~"
+        );
+        assert_eq!(
+            packet("a\x1b[200~b\u{9b}201~c\u{85}d", true),
+            b"\x1b[200~a[200~b201~cd\x1b[201~"
+        );
+        assert_eq!(packet("x\x03\x04\x1a\x15\x7f\0y\x08", false), b"xy");
+        assert_eq!(
+            packet("one\r\ntwo\nthree\rfour", false),
+            b"one\rtwo\rthree\rfour"
+        );
+        let unicode = "ঢাকা 🚀 é\u{a0}\u{2028}\tend";
+        assert_eq!(packet(unicode, false), unicode.as_bytes());
+        assert_eq!(packet("", true), b"\x1b[200~\x1b[201~");
+        let maximum = "a\x1b".repeat(16384);
+        let framed = packet(&maximum, true);
+        assert_eq!(framed.len(), 16384 + 12);
+        assert_eq!(framed.iter().filter(|byte| **byte == 0x1b).count(), 2);
+        assert!(framed.ends_with(b"\x1b[201~"));
+    }
 
     #[test]
     fn native_terminal_routes_unicode_keys_and_pauses_user_input_when_detached() {
